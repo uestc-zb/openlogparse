@@ -121,9 +121,6 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, signalHandler);
     signal(SIGSEGV, signalCrash);
     signal(SIGUSR1, signalDump);
-    // 阻塞调用
-    //ReplicatorHttpServer::registerServer();
-    // 应该改为
     
     // 在独立线程中启动HTTP服务器
     std::thread httpThread([]() {
