@@ -116,119 +116,11 @@ namespace {
         }
     }
 
-    static int mainFunction(int argc, const char **argv, OpenLogReplicator::Ctx *mainCtx) {
-        int ret = 1;
-        struct utsname name{};
-        if (uname(&name) != 0) exit(-1);
-        std::string buildArch;
-        if (strlen(OpenLogReplicator_CMAKE_BUILD_TIMESTAMP) > 0)
-            buildArch = ", build-arch: " OpenLogReplicator_CPU_ARCH;
-
-        mainCtx->welcome("OpenLogReplicator v" + std::to_string(OpenLogReplicator_VERSION_MAJOR) + "." +
-                         std::to_string(OpenLogReplicator_VERSION_MINOR) + "." + std::to_string(
-                             OpenLogReplicator_VERSION_PATCH) +
-                         " (C) 2018-2025 by Adam Leszczynski (aleszczynski@bersler.com), see LICENSE file for licensing information");
-        mainCtx->welcome("arch: " + std::string(name.machine) + buildArch + ", system: " + name.sysname +
-                         ", release: " + name.release + ", build: " +
-                         OpenLogReplicator_CMAKE_BUILD_TYPE + ", compiled: " + OpenLogReplicator_CMAKE_BUILD_TIMESTAMP +
-                         ", modules:"
-                         HAS_KAFKA HAS_OCI HAS_PROMETHEUS HAS_PROTOBUF HAS_ZEROMQ HAS_STATIC HAS_THREAD_INFO);
-
-        const char *fileName = "scripts/OpenLogReplicator.json";
-        try {
-            bool forceRoot = true;
-            const std::regex regexTest(".*");
-            const std::string regexString("check if matches!");
-            const bool regexWorks = regex_search(regexString, regexTest);
-            if (!regexWorks)
-                throw OpenLogReplicator::RuntimeException(
-                    10019, "binaries are build with no regex implementation, check if you have gcc version >= 4.9");
-
-            for (int i = 1; i < argc; ++i) {
-                const std::string arg = argv[i];
-                if (arg == "-v" || arg == "--version") {
-                    // Print banner and exit
-                    return 0;
-                }
-
-                if (arg == "-r" || arg == "--root") {
-                    // Allow bad practice to run as root
-                    forceRoot = true;
-                    continue;
-                }
-
-                if (i + 1 < argc && (arg == "-f" || arg == "--file")) {
-                    // Custom config path
-                    fileName = argv[i + 1];
-                    ++i;
-                    continue;
-                }
-
-                if (i + 1 < argc && (arg == "-p" || arg == "--process")) {
-                    // Custom process name
-#if __linux__
-                    pthread_setname_np(pthread_self(), argv[i + 1]);
-#endif
-#if __APPLE__
-                    pthread_setname_np(argv[i + 1]);
-#endif
-                    ++i;
-                    continue;
-                }
-
-                if (geteuid() == 0) {
-                    if (!forceRoot)
-                        throw OpenLogReplicator::RuntimeException(
-                            10020, "program is run as root, you should never do that");
-                    mainCtx->warning(10020, "program is run as root, you should never do that");
-                }
-
-                throw OpenLogReplicator::ConfigurationException(
-                    30002, "invalid arguments, run: " + std::string(argv[0]) + " [-v|--version] [-f|--file CONFIG] "
-                           "[-p|--process PROCESSNAME] [-r|--root]");
-            }
-        } catch (OpenLogReplicator::ConfigurationException &ex) {
-            mainCtx->error(ex.code, ex.msg);
-            return 1;
-        } catch (OpenLogReplicator::RuntimeException &ex) {
-            mainCtx->error(ex.code, ex.msg);
-            return 1;
-        }
-        OpenLogReplicator::OpenLogReplicator openLogReplicator = mainCtx->config.empty()
-                                                                     ? OpenLogReplicator::OpenLogReplicator(
-                                                                         fileName, mainCtx)
-                                                                     : OpenLogReplicator::OpenLogReplicator(
-                                                                         mainCtx->config.c_str(),
-                                                                         OpenLogReplicator::WEB_CONFIG_FILE_NAME,
-                                                                         mainCtx);
-        try {
-            ret = openLogReplicator.run();
-        } catch (OpenLogReplicator::ConfigurationException &ex) {
-            mainCtx->error(ex.code, ex.msg);
-            mainCtx->stopHard();
-        } catch (OpenLogReplicator::DataException &ex) {
-            mainCtx->error(ex.code, ex.msg);
-            mainCtx->stopHard();
-        } catch (OpenLogReplicator::RuntimeException &ex) {
-            mainCtx->error(ex.code, ex.msg);
-            mainCtx->stopHard();
-        } catch (std::bad_alloc &ex) {
-            mainCtx->error(10018, "memory allocation failed: " + std::string(ex.what()));
-            mainCtx->stopHard();
-        }
-
-        return ret;
-    }
-}
-
 int main(int argc, char **argv) {
     signal(SIGINT, signalHandler);
     signal(SIGPIPE, signalHandler);
     signal(SIGSEGV, signalCrash);
     signal(SIGUSR1, signalDump);
-    // 阻塞调用
-    //ReplicatorHttpServer::registerServer();
-    // 应该改为
     
     // 在独立线程中启动HTTP服务器
     std::thread httpThread([]() {
