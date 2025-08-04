@@ -80,7 +80,6 @@ along with OpenLogReplicator; see the file LICENSE;  If not see
 #endif /* THREAD_INFO */
 
 namespace {
-    // OpenLogReplicator::Ctx* mainCtx = nullptr;
     std::map<std::string, std::shared_ptr<OpenLogReplicator::Ctx>> mainCtxMap;
     // 添加一个全局变量来控制程序退出
     volatile bool shouldTerminate = false;
