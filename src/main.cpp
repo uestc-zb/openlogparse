@@ -89,7 +89,10 @@ namespace {
             ctx->printStacktrace();
         }
     }
-
+    void printtest()
+    {
+        return;
+    }
     void signalHandler(int s) {
         // 在接收到SIGINT信号时设置终止标志
         if (s == SIGINT) {
@@ -126,28 +129,7 @@ int main(int argc, char **argv) {
     std::thread httpThread([]() {
         ReplicatorHttpServer::registerServer();
     });
-    //httpThread.detach(); // 或者在程序结束时join
-    /*
-    std::string input;
-    std::cout << "Command format:\n"
-            << "  start <id>  \n"
-            << "  stop <id>   \n"
-            << "  exit        \n";
 
-
-    ReplicatorManager::ReplicatorManager replicator_manager;
-    while (true) {
-        std::cout << "> ";
-        std::getline(std::cin, input);
-
-        if (input == "exit") {
-            replicator_manager.exit();
-            break;
-        }
-
-        replicator_manager.process_command(input);
-    }
-    */
     std::shared_ptr<OpenLogReplicator::Ctx> ctx = std::make_shared<OpenLogReplicator::Ctx>();
 
 
