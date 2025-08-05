@@ -35,9 +35,7 @@ namespace ReplicatorManager {
 
     public:
         // 存储所有复制任务的哈希表，键为任务ID
-        std::unordered_map<std::string, ThreadInfo> threads; 
-        // 处理控制命令
-        void process_command(const std::string &cmd);
+        std::unordered_map<std::string, ThreadInfo> threads;
         // 启动新复制任务，参数为任务ID和JSON配置
         void start(std::string id, const std::string &config_basic_string);
         // 停止指定ID的复制任务

@@ -82,6 +82,12 @@ namespace OpenLogReplicator {
         static constexpr uint64_t MEMORY_CHUNK_SIZE{MEMORY_CHUNK_SIZE_MB * 1024 * 1024};
         static constexpr uint64_t MEMORY_CHUNK_MIN_MB{32};
 
+        /**
+         * @brief 表示无效或空的块号常量
+         * 
+         * 该常量值为0xFFFFFFFF(4294967295)，在Oracle数据库上下文中通常用来表示一个无效的或空的块号。
+         * 在OpenLogReplicator项目中，它可能被用作初始化值或比较基准，用于检测未设置或无效的块号。
+         */
         static constexpr typeBlk ZERO_BLK{0xFFFFFFFF};
 
         static constexpr uint64_t BAD_TIMEZONE{0x7FFFFFFFFFFFFFFF};
@@ -107,6 +113,12 @@ namespace OpenLogReplicator {
 
         uint trace{0};
         uint flags{0};
+        /**
+         * @brief 禁用检查标志位集合
+         * 
+         * 用于存储禁用的各种检查标志，每个标志通过位运算进行设置和检查。
+         * 例如，DISABLE_CHECKS::BLOCK_SUM 对应第3位（值为4）。
+         */
         uint disableChecks{0};
         LOG logLevel{LOG::INFO};
 
@@ -130,15 +142,14 @@ namespace OpenLogReplicator {
         bool bigEndian{false};
 
     public:
-        //配置更新标志
-        std::atomic<bool> configUpdated = false;
+        std::atomic<bool> configUpdated = false;    //配置更新标志
 
         uint64_t memoryModulesHWM[MEMORY_COUNT]{0, 0, 0, 0, 0, 0};
 
         Metrics* metrics{nullptr};
         Clock* clock{nullptr};
-        std::string versionStr;
-        std::string config;
+        std::string versionStr;                             // 版本字符串
+        std::string config;                                 // 配置文件内容
         std::unique_ptr<std::ofstream> dumpStream;
         int64_t dbTimezone{BAD_TIMEZONE};
         int64_t hostTimezone;
@@ -179,7 +190,7 @@ namespace OpenLogReplicator {
 
         // Transaction buffer
         std::string dumpPath{"."};
-        std::string redoCopyPath;
+        std::string redoCopyPath; // 重做日志复制路径，用于指定重做日志的复制目录
         uint64_t stopLogSwitches{0};
         uint64_t stopCheckpoints{0};
         uint64_t stopTransactions{0};
@@ -217,6 +228,16 @@ namespace OpenLogReplicator {
             return logLevel >= level;
         }
 
+        /**
+         * @brief 检查是否设置了指定的禁用检查标志
+         * 
+         * 通过位运算检查disableChecks成员变量中是否包含指定的禁用标志。
+         * 每个DISABLE_CHECKS枚举值对应一个位标志，例如BLOCK_SUM = 1 << 2 (即4)。
+         * 
+         * @param mask 要检查的禁用标志掩码
+         * @return true 如果设置了指定的禁用标志
+         * @return false 如果未设置指定的禁用标志
+         */
         bool isDisableChecksSet(DISABLE_CHECKS mask) const {
             return (disableChecks & static_cast<uint>(mask)) != 0;
         }
@@ -235,6 +256,16 @@ namespace OpenLogReplicator {
             return read16Little(buf);
         }
 
+        /**
+         * @brief 从字节数组中读取32位无符号整数
+         * 
+         * 根据系统字节序(bigEndian)选择合适的函数读取32位无符号整数:
+         * - 如果是大端序系统，调用read32Big()
+         * - 如果是小端序系统，调用read32Little()
+         * 
+         * @param buf 指向字节数组的指针
+         * @return 读取的32位无符号整数
+         */
         uint32_t read32(const uint8_t* buf) const {
             if (bigEndian)
                 return read32Big(buf);
@@ -253,6 +284,16 @@ namespace OpenLogReplicator {
             return read64Little(buf);
         }
 
+        /**
+         * @brief 根据系统字节序读取SCN(System Change Number)值
+         * 
+         * 该函数根据当前系统字节序(bigEndian)选择合适的SCN读取方法:
+         * - 当系统为大端序时，调用readScnBig()方法读取
+         * - 当系统为小端序时，调用readScnLittle()方法读取
+         * 
+         * @param buf 指向包含SCN数据的字节数组指针
+         * @return 解析得到的SCN值
+         */
         Scn readScn(const uint8_t* buf) const {
             if (bigEndian)
                 return readScnBig(buf);
@@ -313,11 +354,31 @@ namespace OpenLogReplicator {
                    (static_cast<uint32_t>(buf[1]) << 8) | static_cast<uint32_t>(buf[2]);
         }
 
+        /**
+         * @brief 以小端序格式从字节数组中读取32位无符号整数
+         * 
+         * 按照小端序(Little Endian)格式读取4个字节:
+         * - buf[0] 为最低有效字节
+         * - buf[3] 为最高有效字节
+         * 
+         * @param buf 指向字节数组的指针
+         * @return 读取的32位无符号整数
+         */
         static uint32_t read32Little(const uint8_t* buf) {
             return static_cast<uint32_t>(buf[0]) | (static_cast<uint32_t>(buf[1]) << 8) |
                    (static_cast<uint32_t>(buf[2]) << 16) | (static_cast<uint32_t>(buf[3]) << 24);
         }
 
+        /**
+         * @brief 以大端序格式从字节数组中读取32位无符号整数
+         * 
+         * 按照大端序(Big Endian)格式读取4个字节:
+         * - buf[0] 为最高有效字节
+         * - buf[3] 为最低有效字节
+         * 
+         * @param buf 指向字节数组的指针
+         * @return 读取的32位无符号整数
+         */
         static uint32_t read32Big(const uint8_t* buf) {
             return (static_cast<uint32_t>(buf[0]) << 24) | (static_cast<uint32_t>(buf[1]) << 16) |
                    (static_cast<uint32_t>(buf[2]) << 8) | static_cast<uint32_t>(buf[3]);
@@ -351,6 +412,18 @@ namespace OpenLogReplicator {
                    (static_cast<uint64_t>(buf[6]) << 8) | static_cast<uint64_t>(buf[7]);
         }
 
+        /**
+         * @brief 以小端序格式解析SCN(System Change Number)值
+         * 
+         * 该函数按照小端序(Little Endian)格式解析6字节或8字节的SCN值:
+         * - 首先检查是否为特殊值(6个0xFF字节)，如果是则返回Scn::none()
+         * - 检查第5个字节(buf[5])的最高位是否为1，判断是否为8字节格式
+         *   - 如果是8字节格式: buf[0]-buf[3]为低4字节，buf[6]-buf[7]为高2字节，buf[4]为第7字节，buf[5]的低7位为第8字节
+         *   - 如果是6字节格式: buf[0]-buf[5]直接组成SCN值
+         * 
+         * @param buf 指向包含SCN数据的字节数组指针
+         * @return 解析得到的SCN值
+         */
         static Scn readScnLittle(const uint8_t* buf) {
             if (buf[0] == 0xFF && buf[1] == 0xFF && buf[2] == 0xFF && buf[3] == 0xFF && buf[4] == 0xFF && buf[5] == 0xFF)
                 return Scn::none();
@@ -359,6 +432,18 @@ namespace OpenLogReplicator {
             return Scn(buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
         }
 
+        /**
+         * @brief 以大端序格式解析SCN(System Change Number)值
+         * 
+         * 该函数按照大端序(Big Endian)格式解析6字节或8字节的SCN值:
+         * - 首先检查是否为特殊值(6个0xFF字节)，如果是则返回Scn::none()
+         * - 检查第4个字节(buf[4])的最高位是否为1，判断是否为8字节格式
+         *   - 如果是8字节格式: buf[3]-buf[0]为低4字节，buf[7]-buf[6]为高2字节，buf[5]为第7字节，buf[4]的低7位为第8字节
+         *   - 如果是6字节格式: buf[3]-buf[0]为低4字节，buf[5]-buf[4]为高2字节
+         * 
+         * @param buf 指向包含SCN数据的字节数组指针
+         * @return 解析得到的SCN值
+         */
         static Scn readScnBig(const uint8_t* buf) {
             if (buf[0] == 0xFF && buf[1] == 0xFF && buf[2] == 0xFF && buf[3] == 0xFF && buf[4] == 0xFF && buf[5] == 0xFF)
                 return Scn::none();
@@ -558,7 +643,7 @@ namespace OpenLogReplicator {
         void signalHandler(int s);
 
         bool wakeThreads();
-        void spawnThread(Thread* t);
+        void spawnThread(Thread* t); // 启动一个新线程并将其添加到线程管理器中
         void finishThread(Thread* t);
         void signalDump();
 

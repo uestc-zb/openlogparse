@@ -228,36 +228,36 @@ namespace ReplicatorHttpServer {
 
     // 默认JSON配置字符串
     std::string DEFAULT_JSON_CONFIG = R"({
-              "version": "1.8.5",          // 配置版本号
-              "trace": 0,                    // 跟踪级别
-              "source": [                   // 数据源配置数组
+              "version": "1.8.5",
+              "trace": 0,
+              "source": [
                 {
-                  "alias": "S1",          // 数据源别名
-                  "name": "DB1",           // 数据源名称
-                  "reader": {               // 读取器配置
-                    "type": "online",      // 读取器类型为在线模式
-                    "asm": {}               // ASM配置（空）
+                  "alias": "S1",
+                  "name": "DB1",
+                  "reader": {
+                    "type": "online",
+                    "asm": {}
                   },
-                  "format": {               // 数据格式配置
-                    "type": "json",       // 格式类型为JSON
-                    "column": 2,           // 列数
-                    "timestamp-all":1      // 为所有记录添加时间戳
+                  "format": {
+                    "type": "json",
+                    "column": 2,
+                    "timestamp-all":1
                   },
-                  "flags": 96,              // 标志位
-                  "memory": {               // 内存配置
-                    "min-mb": 32,          // 最小内存32MB
-                    "max-mb": 1024         // 最大内存1024MB
+                  "flags": 96,
+                  "memory": {
+                    "min-mb": 32,
+                    "max-mb": 1024
                   }
                 }
               ],
-              "target": [                   // 目标配置数组
+              "target": [
                 {
-                  "alias": "T1",          // 目标别名
-                  "source": "S1",          // 关联的数据源别名
-                  "writer": {               // 写入器配置
-                    "type": "file",        // 写入器类型为文件
-                    "output": "./output_%i.json",  // 输出文件路径模板
-                    "max-file-size": 50000000   // 最大文件大小50MB
+                  "alias": "T1",
+                  "source": "S1",
+                  "writer": {
+                    "type": "file",
+                    "output": "./output_%i.json",
+                    "max-file-size": 50000000
                   }
                 }
               ]

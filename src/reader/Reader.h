@@ -1,22 +1,3 @@
-/* Header for Reader class
-   Copyright (C) 2018-2025 Adam Leszczynski (aleszczynski@bersler.com)
-
-This file is part of OpenLogReplicator.
-
-OpenLogReplicator is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License as published
-by the Free Software Foundation; either version 3, or (at your option)
-any later version.
-
-OpenLogReplicator is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
-Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with OpenLogReplicator; see the file LICENSE;  If not see
-<http://www.gnu.org/licenses/>.  */
-
 #include <atomic>
 #include <vector>
 
@@ -33,9 +14,26 @@ along with OpenLogReplicator; see the file LICENSE;  If not see
 namespace OpenLogReplicator {
     class Reader : public Thread {
     public:
+        /**
+         * @brief Redo日志读取状态码枚举
+         * 
+         * 定义了Redo日志读取过程中可能遇到的各种状态和错误代码
+         */
         enum class REDO_CODE : unsigned char {
-            OK, OVERWRITTEN, FINISHED, STOPPED, SHUTDOWN, EMPTY, ERROR_READ, ERROR_WRITE, ERROR_SEQUENCE, ERROR_CRC, ERROR_BLOCK, ERROR_BAD_DATA,
-            ERROR, CNT
+            OK,                 // 读取成功
+            OVERWRITTEN,        // 数据被覆盖
+            FINISHED,           // 读取完成
+            STOPPED,            // 读取被停止
+            SHUTDOWN,           // 系统关闭
+            EMPTY,              // 空数据
+            ERROR_READ,         // 读取错误
+            ERROR_WRITE,        // 写入错误
+            ERROR_SEQUENCE,     // 序列错误
+            ERROR_CRC,          // CRC校验错误
+            ERROR_BLOCK,        // 块错误
+            ERROR_BAD_DATA,     // 数据损坏
+            ERROR,              // 一般错误
+            CNT                 // 枚举值计数
         };
 
     protected:
@@ -46,28 +44,36 @@ namespace OpenLogReplicator {
         static constexpr uint64_t FLAGS_CLOSEDTHREAD{0x1000};
         static constexpr uint64_t FLAGS_MAXPERFORMANCE{0x2000};
 
+        /**
+         * @brief 读取器状态枚举
+         * 
+         * 定义了读取器可能处于的不同状态
+         */
         enum class STATUS : unsigned char {
-            SLEEPING, CHECK, UPDATE, READ
+            SLEEPING,    // 休眠状态
+            CHECK,       // 检查状态
+            UPDATE,      // 更新状态
+            READ         // 读取状态
         };
 
         static constexpr uint PAGE_SIZE_MAX{4096};
         static constexpr uint BAD_CDC_MAX_CNT{20};
 
-        std::string database;
+        std::string database; // 数据库名称
         int fileCopyDes{-1};
         uint64_t fileSize{0};
         Seq fileCopySequence;
         bool hintDisplayed{false};
-        bool configuredBlockSum;
+        bool configuredBlockSum; // 是否配置了块校验和
         bool readBlocks{false};
         bool reachedZero{false};
         std::string fileNameWrite;
-        int group;
+        int group; // 读取器所属的组
         Seq sequence;
         typeBlk numBlocksHeader{Ctx::ZERO_BLK};
         typeResetlogs resetlogs{0};
         typeActivation activation{0};
-        uint8_t* headerBuffer{nullptr};
+        uint8_t* headerBuffer{nullptr}; // 头部缓冲区，用于存储读取的重做日志头数据
         uint32_t compatVsn{0};
         Time firstTimeHeader{0};
         Scn firstScn{Scn::none()};
@@ -75,7 +81,7 @@ namespace OpenLogReplicator {
         Scn nextScn{Scn::none()};
         Scn nextScnHeader{Scn::none()};
         Time nextTime{0};
-        uint blockSize{0};
+        uint blockSize{0};                                   //!< 重做日志文件的块大小，以字节为单位
         uint64_t sumRead{0};
         uint64_t sumTime{0};
         uint64_t bufferScan{0};
@@ -84,14 +90,14 @@ namespace OpenLogReplicator {
         time_ut readTime{0};
         time_ut loopTime{0};
 
-        std::mutex mtx;
+        std::mutex mtx; // 互斥锁，用于保护读取器的共享资源访问
         std::atomic<uint64_t> bufferStart{0};
         std::atomic<uint64_t> bufferEnd{0};
-        std::atomic<STATUS> status{STATUS::SLEEPING};
+        std::atomic<STATUS> status{STATUS::SLEEPING}; // 读取器当前状态，初始为休眠状态
         std::atomic<REDO_CODE> ret{REDO_CODE::OK};
-        std::condition_variable condBufferFull;
-        std::condition_variable condReaderSleeping;
-        std::condition_variable condParserSleeping;
+        std::condition_variable condBufferFull; // 条件变量，用于缓冲区满时通知等待线程
+        std::condition_variable condReaderSleeping; // 条件变量，用于读取器休眠时的线程同步
+        std::condition_variable condParserSleeping; // 条件变量，用于解析器休眠时的线程同步
 
         virtual void redoClose() = 0;
         virtual REDO_CODE redoOpen() = 0;
@@ -106,7 +112,7 @@ namespace OpenLogReplicator {
 
     public:
         const static char* REDO_MSG[static_cast<uint>(REDO_CODE::CNT)];
-        uint8_t** redoBufferList{nullptr};
+        uint8_t** redoBufferList{nullptr}; // 重做日志缓冲区列表，用于存储读取的重做日志数据
         std::vector<std::string> paths;
         std::string fileName;
 

@@ -59,23 +59,37 @@ along with OpenLogReplicator; see the file LICENSE;  If not see
 #include "TransactionBuffer.h"
 
 namespace OpenLogReplicator {
+    // Parser类的构造函数，初始化解析器对象
     Parser::Parser(Ctx* newCtx, Builder* newBuilder, Metadata* newMetadata, TransactionBuffer* newTransactionBuffer, int newGroup,
                    std::string newPath) :
+            // 初始化上下文对象指针
             ctx(newCtx),
+            // 初始化构建器对象指针
             builder(newBuilder),
+            // 初始化事务缓冲区对象指针
             transactionBuffer(newTransactionBuffer),
+            // 初始化元数据对象指针
             metadata(newMetadata),
+            // 初始化组标识
             group(newGroup),
+            // 初始化文件路径（使用移动语义避免不必要的拷贝）
             path(std::move(newPath)) {
 
+        // 将zero成员变量初始化为0，用于表示空的重做日志记录
         memset(reinterpret_cast<void*>(&zero), 0, sizeof(RedoLogRecord));
 
+        // 为LWN（Log Writer Number）分配内存块
         lwnChunks[0] = ctx->getMemoryChunk(ctx->parserThread, Ctx::MEMORY::PARSER);
+        // 设置解析线程的上下文为CPU状态
         ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+        // 获取内存块的大小指针并设置初始大小
         auto* size = reinterpret_cast<uint64_t*>(lwnChunks[0]);
         *size = sizeof(uint64_t);
+        // 设置已分配的LWN块数量
         lwnAllocated = 1;
+        // 设置最大已分配的LWN块数量
         lwnAllocatedMax = 1;
+        // 初始化LWN成员指针为nullptr
         lwnMembers[0] = nullptr;
     }
 
