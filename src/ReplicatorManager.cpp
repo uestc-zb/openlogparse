@@ -2,84 +2,89 @@
 // Created by tangh on 2025/5/23.
 //
 
-#include <iostream>
-#include <thread>
-#include <atomic>
-#include <unordered_map>
-#include <string>
-#include <sstream>
-#include <mutex>
-
+#include <iostream>      // 包含标准输入输出流库，用于控制台输入输出操作
+#include <thread>       // 包含线程库，用于创建和管理多线程
+#include <atomic>       // 包含原子操作库，用于线程安全的原子变量操作
+#include <unordered_map> // 包含无序映射容器库，用于存储键值对数据结构
+#include <string>       // 包含字符串处理库，用于字符串操作
+#include <sstream>      // 包含字符串流库，用于字符串流操作
+#include <mutex>        // 包含互斥锁库，用于线程同步和数据保护
 #include <algorithm>
-#include <csignal>
-#include <pthread.h>
-#include <regex>
-#include <sys/utsname.h>
-#include <unistd.h>
+#include <csignal>      // 包含信号处理库，用于处理系统信号(如Ctrl+C)
+#include <pthread.h>    // 包含POSIX线程库，用于线程管理
+#include <regex>        // 包含正则表达式库，用于模式匹配
+#include <sys/utsname.h> // 包含系统信息库，用于获取操作系统信息
+#include <unistd.h>     // 包含UNIX标准函数库，提供系统调用接口
 
-#include "OpenLogReplicator.h"
-#include "common/ClockHW.h"
-#include "common/Ctx.h"
-#include "common/Thread.h"
-#include "common/exception/ConfigurationException.h"
-#include "common/exception/RuntimeException.h"
-#include "metadata/Metadata.h"
+#include "OpenLogReplicator.h"          // 包含OpenLogReplicator主类头文件
+#include "common/ClockHW.h"             // 包含硬件时钟相关功能头文件
+#include "common/Ctx.h"                 // 包含上下文管理类头文件
+#include "common/Thread.h"              // 包含线程管理类头文件
+#include "common/exception/ConfigurationException.h" // 包含配置异常类头文件
+#include "common/exception/RuntimeException.h"        // 包含运行时异常类头文件
+#include "metadata/Metadata.h"           // 包含元数据管理类头文件
 
-#include "ReplicatorManager.h"
-#include "common/Ctx.h"
-#include "rapidjson/stringbuffer.h"
-#include "rapidjson/writer.h"
+#include "ReplicatorManager.h"          // 包含复制管理器类头文件
+#include "common/Ctx.h"                 // 重复包含上下文管理类头文件
+#include "rapidjson/stringbuffer.h"     // 包含RapidJSON字符串缓冲区头文件
+#include "rapidjson/writer.h"           // 包含RapidJSON写入器头文件
 
+// 条件编译宏定义，用于根据链接的库定义版本信息字符串
 #ifdef LINK_LIBRARY_OCI
-#define HAS_OCI " OCI"
+#define HAS_OCI " OCI"      // 如果链接了OCI库，则在版本信息中添加" OCI"
 #else
-#define HAS_OCI ""
+#define HAS_OCI ""          // 如果没有链接OCI库，则为空字符串
 #endif /* LINK_LIBRARY_OCI */
 
 #ifdef LINK_LIBRARY_PROTOBUF
-#define HAS_PROTOBUF " Protobuf"
+#define HAS_PROTOBUF " Protobuf"  // 如果链接了Protobuf库，则在版本信息中添加" Protobuf"
 #ifdef LINK_LIBRARY_ZEROMQ
-#define HAS_ZEROMQ " ZeroMQ"
+#define HAS_ZEROMQ " ZeroMQ"      // 如果链接了ZeroMQ库，则在版本信息中添加" ZeroMQ"
 #else
-#define HAS_ZEROMQ ""
+#define HAS_ZEROMQ ""             // 如果没有链接ZeroMQ库，则为空字符串
 #endif /* LINK_LIBRARY_ZEROMQ */
 #else
-#define HAS_PROTOBUF ""
-#define HAS_ZEROMQ ""
+#define HAS_PROTOBUF ""           // 如果没有链接Protobuf库，则为空字符串
+#define HAS_ZEROMQ ""             // 如果没有链接ZeroMQ库，则为空字符串
 #endif /* LINK_LIBRARY_PROTOBUF */
 
 #ifdef LINK_LIBRARY_RDKAFKA
-#define HAS_KAFKA " Kafka"
+#define HAS_KAFKA " Kafka"        // 如果链接了Kafka库，则在版本信息中添加" Kafka"
 #else
-#define HAS_KAFKA ""
+#define HAS_KAFKA ""              // 如果没有链接Kafka库，则为空字符串
 #endif /* LINK_LIBRARY_RDKAFKA */
 
 #ifdef LINK_LIBRARY_PROMETHEUS
-#define HAS_PROMETHEUS " Prometheus"
+#define HAS_PROMETHEUS " Prometheus"  // 如果链接了Prometheus库，则在版本信息中添加" Prometheus"
 #else
-#define HAS_PROMETHEUS ""
+#define HAS_PROMETHEUS ""             // 如果没有链接Prometheus库，则为空字符串
 #endif /* LINK_LIBRARY_PROMETHEUS */
 
 #ifdef LINK_STATIC
-#define HAS_STATIC " static"
+#define HAS_STATIC " static"      // 如果是静态链接，则在版本信息中添加" static"
 #else
-#define HAS_STATIC ""
+#define HAS_STATIC ""             // 如果不是静态链接，则为空字符串
 #endif /* LINK_STATIC */
 
 #ifdef THREAD_INFO
-#define HAS_THREAD_INFO " thread-info"
+#define HAS_THREAD_INFO " thread-info"  // 如果启用了线程信息，则在版本信息中添加" thread-info"
 #else
-#define HAS_THREAD_INFO ""
+#define HAS_THREAD_INFO ""              // 如果没有启用线程信息，则为空字符串
 #endif /* THREAD_INFO */
 
 namespace ReplicatorManager {
-    // �߳�������
+    /**
+     * @brief 线程任务函数，用于启动和管理单个复制任务
+     * 
+     * 该函数负责为每个复制任务创建独立的执行环境，包括：
+     * 1. 检查并设置区域设置环境变量
+     * 2. 构造特定于任务的配置文件路径
+     * 3. 模拟命令行参数调用主函数
+     * 
+     * @param id 任务ID，用于标识不同的复制任务
+     * @param info 线程信息结构体，包含上下文和运行状态
+     */
     static void thread_task(std::string id, const ThreadInfo &info) {
-        // const char *logTimezone = std::getenv("OLR_LOG_TIMEZONE");
-        // if (logTimezone != nullptr)
-        //     if (!OpenLogReplicator::Data::parseTimezone(logTimezone, ctx->logTimezone))
-        //         ctx->warning(10070, "invalid environment variable OLR_LOG_TIMEZONE value: " + std::string(logTimezone));
-
         /*
         检查 OLR_LOCALES 环境变量
         如果设置为 "MOCK"，则配置应用使用模拟区域设置
@@ -91,7 +96,6 @@ namespace ReplicatorManager {
         if (olrLocales == "MOCK")
             OLR_LOCALES = OpenLogReplicator::Ctx::LOCALES::MOCK;
 
-        // const int ret = mainFunction(argc, argv, &ctx);
         /*
         基于任务ID创建特定的配置文件路径
         每个复制任务使用单独的配置文件 (scripts/OpenLogReplicator{ID}.json)
@@ -104,118 +108,31 @@ namespace ReplicatorManager {
         const char *ps[3] = {"main", "-f", fileName.c_str()};
         // std::thread threadF(mainFunction, argc, ps, &ctx);
         mainFunction(3, ps, info.ctx.get());
-
-        // mainFunction(argc, ps, &ctx);
-        // mainCtxMap[id] = &ctx;
-        // while (running) {
-        //     std::this_thread::sleep_for(std::chrono::seconds(1));
-        //     std::cout << "I am Thread " << id << std::endl;
-        // }
-        // std::cout << "Thread " << id << " stopped." << std::endl;
     }
 
-    // 用于处理命令行输入的命令，主要支持启动和停止复制任务
-    void ReplicatorManager::process_command(const std::string &cmd) {
-        /*
-        使用 istringstream 将输入的命令字符串解析成两部分：动作(action)和任务ID
-        期望的格式是 "动作 ID"，例如 "start 1" 或 "stop 2"
-        */
-        std::istringstream iss(cmd);
-        std::string action;
-        std::string id;
-
-        if (!(iss >> action >> id)) {
-            std::cout << "Invalid command!" << std::endl;
-            return;
-        }
-
-        std::lock_guard<std::mutex> lock(map_mutex); // 保护线程map的互斥锁
-
-        if (action == "start") {
-            /*
-            首先检查同ID的任务是否已存在
-            定义一个默认的JSON配置，包含:
-            Oracle数据库连接信息
-            表过滤规则
-            输出目的地和格式设置
-            内存配置
-            调用 start 方法创建新任务线程
-            */
-            if (threads.find(id) != threads.end()) {
-                std::cout << "Thread " << id << " already exists!" << std::endl;
-                return;
-            }
-            std::string config = R"({
-              "version": "1.8.5",
-              "trace": 0,
-              "source": [
-                {
-                  "alias": "S1",
-                  "name": "DB1",
-                  "reader": {
-                    "type": "online",
-                    "user": "USR1",
-                    "password": "USR1PWD",
-                    "server": "//172.17.0.1:4000/XE"
-                  },
-                  "format": {
-                    "type": "json",
-                    "column": 2
-                  },
-                  "flags": 96,
-                  "memory": {
-                    "min-mb": 32,
-                    "max-mb": 1024
-                  },
-                  "filter": {
-                    "table": [
-                      {
-                        "owner": "USR1",
-                        "table": ".*"
-                      }
-                    ]
-                  }
-                }
-              ],
-              "target": [
-                {
-                  "alias": "T1",
-                  "source": "S1",
-                  "writer": {
-                    "type": "file",
-                    "output": "./output1_%i.json",
-                    "max-file-size": 5000000
-                  }
-                }
-              ]
-            }
-            )";
-            //创建新任务线程
-            start(id, std::move(config));
-        } else if (action == "stop") {
-            auto it = threads.find(id);
-            if (it == threads.end()) {
-                std::cout << "Thread " << id << " not found!" << std::endl;
-                return;
-            }
-            stop(id);
-
-            // ָֹͣ���߳�
-
-        } else {
-            std::cout << "Unknown command: " << action << std::endl;
-        }
-    }
-
+    /**
+     * @brief 退出函数，用于停止所有复制任务线程
+     * 
+     * 该函数负责安全地停止所有正在运行的复制任务线程，包括：
+     * 1. 获取线程映射表的互斥锁
+     * 2. 遍历所有线程，设置运行状态为false
+     * 3. 等待线程执行完毕(join)
+     * 4. 清空线程映射表
+     */
     void ReplicatorManager::exit() {
-        // ֹͣ�����߳�
+        // 获取线程映射表的互斥锁，确保线程安全
         std::lock_guard<std::mutex> lock(map_mutex);
+        // 遍历所有线程
         for (auto &[id, info]: threads) {
+            // 设置线程运行状态为false，通知线程停止
             info.running = false;
+            // 检查线程是否可join，避免调用join时出现异常
             if (info.thread->joinable()) {
+                // 等待线程执行完毕
                 info.thread->join();
             }
         }
+        // 清空线程映射表
         threads.clear();
     }
     // 这个函数负责创建和启动一个新的Oracle日志复制任务线程
@@ -255,13 +172,13 @@ namespace ReplicatorManager {
 
     void ReplicatorManager::stop(std::string id) {
         auto it = threads.find(id);
-        it->second.running = false; // ����ֹͣ��־
+        it->second.running = false;
         it->second.ctx->stopHard();
         // it->second
         if (it->second.thread->joinable()) {
-            it->second.thread->join(); // �ȴ��߳̽���
+            it->second.thread->join();
         }
-        threads.erase(it); // ��map���Ƴ�
+        threads.erase(it);
         std::cout << "Stopped thread " << id << std::endl;
     }
 
@@ -376,18 +293,6 @@ namespace ReplicatorManager {
                     ++i;
                     continue;
                 }
-
-                //                 if (i + 1 < argc && (arg == "-p" || arg == "--process")) {
-                //                     // Custom process name
-                // #if __linux__
-                //                     pthread_setname_np(pthread_self(), argv[i + 1]);
-                // #endif
-                // #if __APPLE__
-                //                     pthread_setname_np(argv[i + 1]);
-                // #endif
-                //                     ++i;
-                //                     continue;
-                //                 }
 
                 if (geteuid() == 0) {
                     if (!forceRoot)

@@ -1704,56 +1704,99 @@ namespace OpenLogReplicator {
         contextSet(CONTEXT::CPU);
     }
 
+    /**
+     * @brief 在线获取归档日志
+     * 
+     * 此函数用于从数据库在线获取归档日志文件，并将其添加到解析队列中。
+     * 
+     * @param replicator 指向Replicator对象的指针
+     */
     void ReplicatorOnline::archGetLogOnline(Replicator* replicator) {
+        // 将传入的replicator指针动态转换为ReplicatorOnline类型
         auto* replicatorOnline = dynamic_cast<ReplicatorOnline*>(replicator);
+        // 如果转换失败，直接返回
         if (replicatorOnline == nullptr)
             return;
 
+        // 检查数据库连接是否正常，如果不正常则返回
         if (!replicatorOnline->checkConnection())
             return;
 
+        // 如果resetlogs为0，说明数据库化身信息未初始化，需要更新
         if (replicator->metadata->resetlogs == 0) {
+            // 记录日志信息
             replicatorOnline->ctx->info(0, "resetlogs_id not initialized, updating database incarnation info");
+            // 更新数据库化身信息
             replicatorOnline->updateDatabaseIncarnation();
         }
 
+        // 开始数据库查询操作
         {
+            // 获取查询归档日志列表的SQL语句
             std::string sql = replicatorOnline->sqlGetArchiveLogList();
+            // 创建数据库语句对象
             DatabaseStatement stmt(replicatorOnline->conn);
+            // 如果启用了SQL跟踪，则记录SQL语句和参数
             if (unlikely(replicator->ctx->isTraceSet(Ctx::TRACE::SQL))) {
+                // 记录SQL语句
                 replicator->ctx->logTrace(Ctx::TRACE::SQL, std::string(sql));
+                // 记录第一个参数：序列号
                 replicator->ctx->logTrace(Ctx::TRACE::SQL, "PARAM1: " +
                                                            replicatorOnline->metadata->sequence.toString());
+                // 记录第二个参数：resetlogs值
                 replicator->ctx->logTrace(Ctx::TRACE::SQL, "PARAM2: " + std::to_string(replicator->metadata->resetlogs));
             }
 
+            // 创建SQL语句
             stmt.createStatement(sql);
+            // 绑定第一个参数：序列号
             stmt.bindUInt(1, (reinterpret_cast<ReplicatorOnline*>(replicator))->metadata->sequence);
+            // 绑定第二个参数：resetlogs值
             stmt.bindUInt(2, replicator->metadata->resetlogs);
 
+            // 定义用于存储查询结果的变量
+            // 存储日志文件路径
             std::array<char, 513> path {};
+            // 定义第一个字段：路径
             stmt.defineString(1, path.data(), path.size());
+            // 存储序列号
             Seq sequence;
+            // 定义第二个字段：序列号
             stmt.defineUInt(2, sequence);
+            // 存储第一个SCN
             Scn firstScn;
+            // 定义第三个字段：第一个SCN
             stmt.defineUInt(3, firstScn);
+            // 存储下一个SCN
             Scn nextScn;
+            // 定义第四个字段：下一个SCN
             stmt.defineUInt(4, nextScn);
 
+            // 执行查询并获取结果
             int ret = stmt.executeQuery();
+            // 遍历查询结果
             while (ret != 0) {
+                // 获取映射后的路径
                 std::string mappedPath(path.data());
+                // 应用路径映射
                 replicator->applyMapping(mappedPath);
 
+                // 创建新的解析器对象
                 auto* parser = new Parser(replicator->ctx, replicator->builder, replicator->metadata,
                                           replicator->transactionBuffer, 0, mappedPath);
+                // 设置解析器的第一个SCN
                 parser->firstScn = firstScn;
+                // 设置解析器的下一个SCN
                 parser->nextScn = nextScn;
+                // 设置解析器的序列号
                 parser->sequence = sequence;
+                // 将解析器添加到归档重做日志队列中
                 (reinterpret_cast<ReplicatorOnline*>(replicator))->archiveRedoQueue.push(parser);
+                // 获取下一行结果
                 ret = stmt.next();
             }
         }
+        // 进入待机状态
         replicator->goStandby();
     }
 

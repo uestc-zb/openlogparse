@@ -1,22 +1,3 @@
-/* Base class for process which is reading from redo log files
-   Copyright (C) 2018-2025 Adam Leszczynski (aleszczynski@bersler.com)
-
-This file is part of OpenLogReplicator.
-
-OpenLogReplicator is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License as published
-by the Free Software Foundation; either version 3, or (at your option)
-any later version.
-
-OpenLogReplicator is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
-Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with OpenLogReplicator; see the file LICENSE;  If not see
-<http://www.gnu.org/licenses/>.  */
-
 #define _LARGEFILE_SOURCE
 #define _FILE_OFFSET_BITS 64
 
@@ -47,12 +28,20 @@ namespace OpenLogReplicator {
             group(newGroup) {
     }
 
+    /**
+     * @brief 初始化读取器资源
+     * 
+     * 此函数用于初始化读取器所需的内存缓冲区和其他资源。
+     * 包括分配重做日志缓冲区列表、头部缓冲区，并检查重做日志复制路径。
+     */
     void Reader::initialize() {
+        // 如果重做日志缓冲区列表未分配，则分配内存
         if (redoBufferList == nullptr) {
             redoBufferList = new uint8_t* [ctx->memoryChunksReadBufferMax];
             memset(reinterpret_cast<void*>(redoBufferList), 0, ctx->memoryChunksReadBufferMax * sizeof(uint8_t*));
         }
 
+        // 如果头部缓冲区未分配，则分配内存
         if (headerBuffer == nullptr) {
             headerBuffer = reinterpret_cast<uint8_t*>(aligned_alloc(Ctx::MEMORY_ALIGNMENT, PAGE_SIZE_MAX * 2));
             if (unlikely(headerBuffer == nullptr))
@@ -60,45 +49,90 @@ namespace OpenLogReplicator {
                                               " bytes memory for: read header");
         }
 
+        // 如果重做日志复制路径不为空，则检查路径是否可访问
         if (!ctx->redoCopyPath.empty()) {
             if (opendir(ctx->redoCopyPath.c_str()) == nullptr)
                 throw RuntimeException(10012, "directory: " + ctx->redoCopyPath + " - can't read");
         }
     }
 
+    /**
+     * @brief 唤醒读取器线程
+     * 
+     * 当需要中断读取器的等待状态时调用此函数，例如在系统关闭或需要重新加载配置时。
+     * 该函数会通知所有等待条件变量的线程，包括缓冲区满、读取器休眠和解析器休眠的线程。
+     */
     void Reader::wakeUp() {
+        // 设置上下文为互斥锁，记录唤醒原因
         contextSet(CONTEXT::MUTEX, REASON::READER_WAKE_UP);
         {
+            // 获取互斥锁并通知所有等待的条件变量
             std::unique_lock<std::mutex> const lck(mtx);
             condBufferFull.notify_all();
             condReaderSleeping.notify_all();
             condParserSleeping.notify_all();
         }
+        // 恢复上下文为CPU执行
         contextSet(CONTEXT::CPU);
     }
 
+    /**
+     * @brief Reader类的析构函数
+     * 
+     * 负责释放Reader对象占用的所有资源，包括：
+     * - 释放所有读取缓冲区(chunk)
+     * - 释放redo日志缓冲区列表
+     * - 释放文件头缓冲区
+     * - 关闭文件复制描述符
+     */
     Reader::~Reader() {
+        // 释放所有读取缓冲区(chunk)
         for (uint num = 0; num < ctx->memoryChunksReadBufferMax; ++num)
             bufferFree(this, num);
 
+        // 释放redo日志缓冲区列表
         delete[] redoBufferList;
         redoBufferList = nullptr;
 
+        // 释放文件头缓冲区
         if (headerBuffer != nullptr) {
             free(headerBuffer);
             headerBuffer = nullptr;
         }
 
+        // 关闭文件复制描述符
         if (fileCopyDes != -1) {
             close(fileCopyDes);
             fileCopyDes = -1;
         }
     }
 
+    /**
+     * @brief 检查Redo Log块头的有效性
+     * 
+     * 该函数验证Redo Log块头的多个属性，包括块大小、块号、序列号和校验和。
+     * 如果任何检查失败，函数将返回相应的错误代码。
+     * 
+     * @param buffer 指向块头数据的指针
+     * @param blockNumber 预期的块号
+     * @param showHint 是否显示错误提示
+     * @return REDO_CODE 检查结果代码
+     *   - REDO_CODE::OK: 所有检查通过
+     *   - REDO_CODE::EMPTY: 空块
+     *   - REDO_CODE::ERROR_BAD_DATA: 块大小无效
+     *   - REDO_CODE::ERROR_SEQUENCE: 序列号不匹配
+     *   - REDO_CODE::ERROR_BLOCK: 块号不匹配
+     *   - REDO_CODE::ERROR_CRC: 校验和错误
+     *   - REDO_CODE::OVERWRITTEN: 块被覆盖
+     */
     Reader::REDO_CODE Reader::checkBlockHeader(uint8_t* buffer, typeBlk blockNumber, bool showHint) {
+        // 检查是否为空块(前两个字节都为0)
         if (buffer[0] == 0 && buffer[1] == 0)
             return REDO_CODE::EMPTY;
 
+        // 验证块大小标记是否正确
+        // 对于512和1024字节的块，标记应为0x22
+        // 对于4096字节的块，标记应为0x82
         if ((blockSize == 512 && buffer[1] != 0x22) ||
             (blockSize == 1024 && buffer[1] != 0x22) ||
             (blockSize == 4096 && buffer[1] != 0x82)) {
@@ -107,19 +141,27 @@ namespace OpenLogReplicator {
             return REDO_CODE::ERROR_BAD_DATA;
         }
 
+        // 从块头中读取块号和序列号
         const typeBlk blockNumberHeader = ctx->read32(buffer + 4);
         const Seq sequenceHeader = Seq(ctx->read32(buffer + 8));
 
+        // 检查序列号是否匹配
+        // 如果是第一个块(sequence未初始化)或状态为UPDATE，则更新序列号
+        // 否则根据group值进行不同的序列号验证
         if (sequence == Seq::zero() || status == STATUS::UPDATE) {
             sequence = sequenceHeader;
         } else {
             if (group == 0) {
+                // 对于归档日志(group=0)，序列号必须完全匹配
                 if (sequence != sequenceHeader) {
                     ctx->warning(60024, "file: " + fileName + " - invalid header sequence, found: " + sequenceHeader.toString() +
                                         ", expected: " + sequence.toString());
                     return REDO_CODE::ERROR_SEQUENCE;
                 }
             } else {
+                // 对于在线日志(group!=0)
+                // 如果序列号大于块头中的序列号，表示块为空
+                // 如果序列号小于块头中的序列号，表示块已被覆盖
                 if (sequence > sequenceHeader)
                     return REDO_CODE::EMPTY;
                 if (sequence < sequenceHeader)
@@ -127,20 +169,26 @@ namespace OpenLogReplicator {
             }
         }
 
+        // 验证块号是否匹配
         if (blockNumberHeader != blockNumber) {
             ctx->error(40002, "file: " + fileName + " - invalid header block number: " + std::to_string(blockNumberHeader) +
                               ", expected: " + std::to_string(blockNumber));
             return REDO_CODE::ERROR_BLOCK;
         }
 
+        // 如果未禁用块校验和检查，则验证校验和
         if (!ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::BLOCK_SUM)) {
+            // 从块头读取存储的校验和
             const typeSum chSum = ctx->read16(buffer + 14);
+            // 计算实际的校验和
             const typeSum chSumCalculated = calcChSum(buffer, blockSize);
+            // 比较两者是否一致
             if (chSum != chSumCalculated) {
                 if (showHint) {
                     ctx->warning(60025, "file: " + fileName + " - block: " + std::to_string(blockNumber) +
                                         " - invalid header checksum, expected: " + std::to_string(chSum) + ", calculated: " +
                                         std::to_string(chSumCalculated));
+                    // 如果尚未显示提示信息，则显示配置建议
                     if (!hintDisplayed) {
                         if (!configuredBlockSum) {
                             ctx->hint("set DB_BLOCK_CHECKSUM = TYPICAL on the database or turn off consistency checking in OpenLogReplicator"
@@ -167,34 +215,66 @@ namespace OpenLogReplicator {
         return prevRead;
     }
 
+    /**
+     * @brief 读取并验证重做日志文件头部
+     * 
+     * 该函数负责从重做日志文件中读取头部信息并进行基本验证，
+     * 包括检查文件头标识、字节序、块大小等关键信息。
+     * 如果启用了日志复制功能，还会将读取的头部信息写入复制文件。
+     * 
+     * Oracle重做日志文件头部结构说明:
+     * - Block 0 (文件头块):
+     *   - headerBuffer[0]: 文件标识 (正常为0)
+     *   - headerBuffer[1]: 文件类型标识 (0x22表示重做日志)
+     *   - 偏移20处4字节: 块大小 (512/1024/4096字节)
+     *   - 偏移28-31处4字节: 字节序标识 (0x7A7B7C7D/0x7D7C7B7A)
+     * - Block 1 (重做头块):
+     *   - 包含数据库版本、SCN、序列号等元数据
+     * 
+     * @return REDO_CODE::OK 如果头部读取和验证成功
+     * @return REDO_CODE::ERROR 如果发生错误
+     * @return REDO_CODE::ERROR_READ 如果读取失败
+     * @return REDO_CODE::ERROR_BAD_DATA 如果数据验证失败
+     * @return REDO_CODE::ERROR_WRITE 如果写入复制文件失败
+     */
     Reader::REDO_CODE Reader::reloadHeaderRead() {
+        // 检查是否触发软关闭，如果是则返回错误
         if (ctx->softShutdown)
             return REDO_CODE::ERROR;
 
+        // 读取文件头部数据，如果已知块大小则读取两个块的数据，否则读取默认最大页面大小的两倍
         int actualRead = redoRead(headerBuffer, 0, blockSize > 0 ? blockSize * 2 : PAGE_SIZE_MAX * 2);
         if (actualRead < Ctx::MIN_BLOCK_SIZE) {
             ctx->error(40003, "file: " + fileName + " - " + strerror(errno));
             return REDO_CODE::ERROR_READ;
         }
+        // 如果配置了指标收集，则记录读取的字节数
         if (ctx->metrics != nullptr)
             ctx->metrics->emitBytesRead(actualRead);
 
-        // Check file header
+        // 检查文件头部标识，正常情况下header[0]应该为0
         if (headerBuffer[0] != 0) {
             ctx->error(40003, "file: " + fileName + " - invalid header[0]: " + std::to_string(static_cast<uint>(headerBuffer[0])));
             return REDO_CODE::ERROR_BAD_DATA;
         }
 
+        // 检查字节序标识，判断是否需要设置大端序
         if (headerBuffer[28] == 0x7A && headerBuffer[29] == 0x7B && headerBuffer[30] == 0x7C && headerBuffer[31] == 0x7D) {
+            // 如果当前不是大端序，则设置为大端序
             if (!ctx->isBigEndian())
                 ctx->setBigEndian();
         } else if (headerBuffer[28] != 0x7D || headerBuffer[29] != 0x7C || headerBuffer[30] != 0x7B || headerBuffer[31] != 0x7A || ctx->isBigEndian()) {
+            // 如果字节序标识不匹配，报告错误
             ctx->error(40004, "file: " + fileName + " - invalid header[28-31]: " + std::to_string(static_cast<uint>(headerBuffer[28])) +
                               ", " + std::to_string(static_cast<uint>(headerBuffer[29])) + ", " + std::to_string(static_cast<uint>(headerBuffer[30])) +
                               ", " + std::to_string(static_cast<uint>(headerBuffer[31])));
             return REDO_CODE::ERROR_BAD_DATA;
         }
 
+        // 验证块大小是否有效
+        // headerBuffer[1]是文件类型标识，0x22表示重做日志文件，0x82也表示重做日志文件
+        // 当headerBuffer[1]为0x22时，块大小应为512或1024字节
+        // 当headerBuffer[1]为0x82时，块大小应为4096字节
         bool blockSizeOK = false;
         blockSize = ctx->read32(headerBuffer + 20);
         if ((blockSize == 512 && headerBuffer[1] == 0x22) || (blockSize == 1024 && headerBuffer[1] == 0x22) || (blockSize == 4096 && headerBuffer[1] == 0x82))
@@ -207,16 +287,29 @@ namespace OpenLogReplicator {
             return REDO_CODE::ERROR_BAD_DATA;
         }
 
+        // 确保实际读取的字节数不少于两个块的大小
         if (actualRead < static_cast<int>(blockSize * 2)) {
             ctx->error(40003, "file: " + fileName + " - " + strerror(errno));
             return REDO_CODE::ERROR_READ;
         }
 
+        // 如果配置了重做日志复制路径，则将头部信息写入复制文件
+        // ctx->redoCopyPath是一个字符串，存储重做日志复制的目标路径
+        // empty()方法用于检查该路径字符串是否为空
+        // ctx->redoCopyPath 字段总结
+        // 作用： 调试参数，用于将处理过的 redo log 文件内容复制到指定目录，便于诊断磁盘读取问题和事后分析 reference-manual.adoc:555-562
+        //
+        // 设置方法： 在 JSON 配置文件的 reader 部分添加 "redo-copy-path" 字段 OpenLogReplicator.cpp:760-761
+        //
+        // 变量定义： 在 Ctx 类中定义为字符串类型，最大长度 2048 字符 Ctx.h:178
         if (!ctx->redoCopyPath.empty()) {
+            // 确保写入的字节数不超过两个块的大小
             if (static_cast<uint>(actualRead) > blockSize * 2)
                 actualRead = static_cast<int>(blockSize * 2);
 
+            // 获取头部中的序列号
             const Seq sequenceHeader = Seq(ctx->read32(headerBuffer + blockSize + 8));
+            // 如果序列号发生变化，关闭当前的复制文件描述符
             if (fileCopySequence != sequenceHeader) {
                 if (fileCopyDes != -1) {
                     close(fileCopyDes);
@@ -224,6 +317,7 @@ namespace OpenLogReplicator {
                 }
             }
 
+            // 如果没有打开复制文件，则创建新的复制文件
             if (fileCopyDes == -1) {
                 fileNameWrite = ctx->redoCopyPath + "/" + database + "_" + sequenceHeader.toString() + ".arc";
                 fileCopyDes = open(fileNameWrite.c_str(), O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR);
@@ -233,6 +327,7 @@ namespace OpenLogReplicator {
                 fileCopySequence = sequenceHeader;
             }
 
+            // 将头部数据写入复制文件
             const int bytesWritten = pwrite(fileCopyDes, headerBuffer, actualRead, 0);
             if (bytesWritten != actualRead) {
                 ctx->error(10007, "file: " + fileNameWrite + " - " + std::to_string(bytesWritten) + " bytes written instead of " +
@@ -244,16 +339,54 @@ namespace OpenLogReplicator {
         return REDO_CODE::OK;
     }
 
+    /**
+     * @brief 解析并验证重做日志文件头部信息
+     * 
+     * 该函数首先调用reloadHeaderRead()读取文件头部，
+     * 然后解析头部中的各种元数据信息，如数据库版本、SCN等，
+     * 并进行一致性验证。
+     * 
+     * @return REDO_CODE::OK 如果头部解析和验证成功
+     * @return REDO_CODE::EMPTY 如果文件为空
+     * @return REDO_CODE::ERROR 如果发生错误
+     * @return REDO_CODE::ERROR_BAD_DATA 如果数据验证失败
+     *
+     *
+     * Block 1 Format:
+     * - Bytes 0-3: Block number (should be 1)
+     * - Bytes 4-7: Block size (should match headerBuffer[1] value)
+     * - Bytes 8-11: First change number (SCN) of the redo log
+     * - Bytes 12-15: Next change number (SCN) of the redo log
+     * - Bytes 16-19: Sequence number of the redo log
+     * - Bytes 20-23: Database compatibility version
+     * - Bytes 24-27: Activation number
+     * - Bytes 28-35: Database SID (8 characters)
+     * - Bytes 36-39: Resetlogs SCN
+     * - Bytes 40-43: Resetlogs time
+     * - Bytes 44-47: Previous resetlogs SCN
+     * - Bytes 48-51: Previous resetlogs time
+     * - Bytes 52-55: Activation number (again)
+     * - Bytes 56-59: First time (timestamp)
+     * - Bytes 60-63: Next time (timestamp)
+     * - Bytes 64-67: Number of blocks in header
+     * - Bytes 68-71: Archive log sequence number
+     * - Bytes 72-75: Archive log sequence number (again)
+     * - Bytes 76-79: Archive log sequence number (again)
+     * - Bytes 80-83: Archive log sequence number (again)
+     */
     Reader::REDO_CODE Reader::reloadHeader() {
+        // 首先读取并验证文件头部
         REDO_CODE retReload = reloadHeaderRead();
         if (retReload != REDO_CODE::OK)
             return retReload;
 
+        // 解析数据库兼容版本
         uint32_t version;
         compatVsn = ctx->read32(headerBuffer + blockSize + 20);
         if (compatVsn == 0)
             return REDO_CODE::EMPTY;
 
+        // 验证数据库版本是否支持
         if ((compatVsn >= 0x0B200000 && compatVsn <= 0x0B200400)        // 11.2.0.0 - 11.2.0.4
             || (compatVsn >= 0x0C100000 && compatVsn <= 0x0C100200)     // 12.1.0.0 - 12.1.0.2
             || (compatVsn >= 0x0C200000 && compatVsn <= 0x0C200100)     // 12.2.0.0 - 12.2.0.1
@@ -266,7 +399,7 @@ namespace OpenLogReplicator {
             ctx->error(40006, "file: " + fileName + " - invalid database version: " + std::to_string(compatVsn));
             return REDO_CODE::ERROR_BAD_DATA;
         }
-
+        // 解析头部中的各种元数据
         activation = ctx->read32(headerBuffer + blockSize + 52);
         numBlocksHeader = ctx->read32(headerBuffer + blockSize + 156);
         resetlogs = ctx->read32(headerBuffer + blockSize + 160);
@@ -275,21 +408,25 @@ namespace OpenLogReplicator {
         nextScnHeader = ctx->readScn(headerBuffer + blockSize + 192);
         nextTime = ctx->read32(headerBuffer + blockSize + 200);
 
+        // 如果是归档日志且文件大小超过头部指定的块数，则更新文件大小
         if (numBlocksHeader != Ctx::ZERO_BLK && fileSize > static_cast<uint64_t>(numBlocksHeader) * blockSize && group == 0) {
             fileSize = static_cast<uint64_t>(numBlocksHeader) * blockSize;
             ctx->info(0, "updating redo log size to: " + std::to_string(fileSize) + " for: " + fileName);
         }
 
+        // 如果是第一次读取文件头部，初始化上下文中的版本信息
         if (ctx->version == 0) {
             char SID[9];
             memcpy(reinterpret_cast<void*>(SID),
                    reinterpret_cast<const void*>(headerBuffer + blockSize + 28), 8);
             SID[8] = 0;
             ctx->version = version;
+            // 如果是23c及以上版本，设置列数限制
             if (compatVsn >= RedoLogRecord::REDO_VERSION_23_0)
                 ctx->columnLimit = Ctx::COLUMN_LIMIT_23_0;
             const Seq sequenceHeader = Seq(ctx->read32(headerBuffer + blockSize + 8));
 
+            // 根据版本号生成版本字符串
             if (compatVsn < RedoLogRecord::REDO_VERSION_18_0) {
                 ctx->versionStr = std::to_string(compatVsn >> 24) + "." + std::to_string((compatVsn >> 20) & 0xF) + "." +
                                   std::to_string((compatVsn >> 16) & 0xF) + "." + std::to_string((compatVsn >> 8) & 0xFF);
@@ -302,12 +439,14 @@ namespace OpenLogReplicator {
                          ", SID: " + SID + ", endian: " + (ctx->isBigEndian() ? "BIG" : "LITTLE"));
         }
 
+        // 验证数据库版本是否与上下文中的版本一致
         if (version != ctx->version) {
             ctx->error(40007, "file: " + fileName + " - invalid database version: " + std::to_string(compatVsn) + ", expected: " +
                               std::to_string(ctx->version));
             return REDO_CODE::ERROR_BAD_DATA;
         }
 
+        // 检查第一个块的CRC校验，如果失败则重试
         uint badBlockCrcCount = 0;
         retReload = checkBlockHeader(headerBuffer + blockSize, 1, false);
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::DISK)))
@@ -315,9 +454,11 @@ namespace OpenLogReplicator {
 
         while (retReload == REDO_CODE::ERROR_CRC) {
             ++badBlockCrcCount;
+            // 如果CRC错误次数超过最大限制，则返回错误
             if (badBlockCrcCount == BAD_CDC_MAX_CNT)
                 return REDO_CODE::ERROR_BAD_DATA;
 
+            // 睡眠一段时间后重试
             contextSet(CONTEXT::SLEEP);
             usleep(ctx->redoReadSleepUs);
             contextSet(CONTEXT::CPU);
@@ -329,17 +470,19 @@ namespace OpenLogReplicator {
         if (retReload != REDO_CODE::OK)
             return retReload;
 
+        // 更新SCN信息
         if (firstScn == Scn::none() || status == STATUS::UPDATE) {
             firstScn = firstScnHeader;
             nextScn = nextScnHeader;
         } else {
+            // 验证first SCN是否一致
             if (firstScnHeader != firstScn) {
                 ctx->error(40008, "file: " + fileName + " - invalid first scn value: " + firstScnHeader.toString() + ", expected: " + firstScn.toString());
                 return REDO_CODE::ERROR_BAD_DATA;
             }
         }
 
-        // Updating nextScn if changed
+        // 更新next SCN信息
         if (nextScn == Scn::none() && nextScnHeader != Scn::none()) {
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::DISK)))
                 ctx->logTrace(Ctx::TRACE::DISK, "updating next scn to: " + nextScnHeader.toString());
@@ -593,30 +736,45 @@ namespace OpenLogReplicator {
     void Reader::mainLoop() {
         while (!ctx->softShutdown) {
             {
+                // 设置上下文为互斥锁状态，表示进入读取器主循环的关键部分
                 contextSet(CONTEXT::MUTEX, REASON::READER_MAIN1);
+                // 获取互斥锁，用于保护共享资源
                 std::unique_lock<std::mutex> lck(mtx);
+                // 通知解析器线程有新的数据可以处理
                 condParserSleeping.notify_all();
 
+                // 如果读取器状态为休眠且没有软关闭请求
                 if (status == STATUS::SLEEPING && !ctx->softShutdown) {
+                    // 如果启用了睡眠跟踪，则记录日志
                     if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                         ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:mainLoop:sleep");
+                    // 设置上下文为等待状态，表示读取器没有工作要做
                     contextSet(CONTEXT::WAIT, REASON::READER_NO_WORK);
+                    // 等待条件变量，直到被唤醒
                     condReaderSleeping.wait(lck);
+                    // 重新设置上下文为互斥锁状态
                     contextSet(CONTEXT::MUTEX, REASON::READER_MAIN2);
                 } else if (status == STATUS::READ && !ctx->softShutdown && (bufferEnd % Ctx::MEMORY_CHUNK_SIZE) == 0) {
+                    // 如果状态为读取且缓冲区末尾位置是内存块大小的倍数，则发出缓冲区满的警告
                     ctx->warning(0, "buffer full?");
                 }
             }
             contextSet(CONTEXT::CPU);
 
+            // 检查是否需要软关闭，如果需要则跳出循环
             if (ctx->softShutdown)
                 break;
 
+            // 如果当前状态为检查状态(CHECK)
             if (status == STATUS::CHECK) {
+                // 如果启用了文件跟踪，则记录尝试打开文件的日志
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::FILE)))
                     ctx->logTrace(Ctx::TRACE::FILE, "trying to open: " + fileName);
+                // 关闭当前文件
                 redoClose();
+                // 尝试重新打开文件
                 const REDO_CODE currentRet = redoOpen();
+                // 更新状态并通知等待的解析器线程
                 {
                     contextSet(CONTEXT::MUTEX, REASON::READER_CHECK_STATUS);
                     std::unique_lock<std::mutex> const lck(mtx);
@@ -625,123 +783,39 @@ namespace OpenLogReplicator {
                     condParserSleeping.notify_all();
                 }
                 contextSet(CONTEXT::CPU);
+                // 继续下一次循环
                 continue;
             }
 
+            // 如果当前状态为更新状态(UPDATE)
             if (status == STATUS::UPDATE) {
+                // 如果文件复制描述符有效，则关闭文件并重置描述符
                 if (fileCopyDes != -1) {
                     close(fileCopyDes);
                     fileCopyDes = -1;
                 }
 
+                // 重置读取统计信息
                 sumRead = 0;
                 sumTime = 0;
+                // 重新加载文件头信息
                 const REDO_CODE currentRet = reloadHeader();
+                // 如果重新加载成功，则重置缓冲区起始和结束位置
                 if (currentRet == REDO_CODE::OK) {
                     bufferStart = blockSize * 2;
                     bufferEnd = blockSize * 2;
                 }
 
+                // 释放所有读取缓冲区
+                // 当文件状态更新时，需要释放旧的缓冲区以便重新读取文件内容
                 for (uint num = 0; num < ctx->memoryChunksReadBufferMax; ++num)
                     bufferFree(this, num);
 
+                // 更新状态并通知等待的解析器线程
                 {
                     contextSet(CONTEXT::MUTEX, REASON::READER_SLEEP1);
                     std::unique_lock<std::mutex> const lck(mtx);
                     ret = currentRet;
-                    status = STATUS::SLEEPING;
-                    condParserSleeping.notify_all();
-                }
-                contextSet(CONTEXT::CPU);
-            } else if (status == STATUS::READ) {
-                if (unlikely(ctx->isTraceSet(Ctx::TRACE::DISK)))
-                    ctx->logTrace(Ctx::TRACE::DISK, "reading " + fileName + " at (" + std::to_string(bufferStart) + "/" +
-                                                    std::to_string(bufferEnd) + ") at size: " + std::to_string(fileSize));
-                lastRead = blockSize;
-                lastReadTime = 0;
-                readTime = 0;
-                bufferScan = bufferEnd;
-                reachedZero = false;
-
-                while (!ctx->softShutdown && status == STATUS::READ) {
-                    loopTime = ctx->clock->getTimeUt();
-                    readBlocks = false;
-                    readTime = 0;
-
-                    if (bufferEnd == fileSize) {
-                        if (nextScnHeader != Scn::none()) {
-                            ret = REDO_CODE::FINISHED;
-                            nextScn = nextScnHeader;
-                        } else {
-                            ctx->warning(60023, "file: " + fileName + " - position: " + std::to_string(bufferScan) +
-                                                " - unexpected end of file");
-                            ret = REDO_CODE::STOPPED;
-                        }
-                        break;
-                    }
-
-                    // Buffer full?
-                    if (bufferStart + ctx->bufferSizeMax == bufferEnd) {
-                        contextSet(CONTEXT::MUTEX, REASON::READER_FULL);
-                        std::unique_lock<std::mutex> lck(mtx);
-                        if (!ctx->softShutdown && bufferStart + ctx->bufferSizeMax == bufferEnd) {
-                            if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
-                                ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:mainLoop:bufferFull");
-                            contextSet(CONTEXT::WAIT, REASON::READER_BUFFER_FULL);
-                            condBufferFull.wait(lck);
-                            contextSet(CONTEXT::CPU);
-                            continue;
-                        }
-                    }
-
-                    if (bufferEnd < bufferScan)
-                        if (!read2())
-                            break;
-
-                    // #1 read
-                    if (bufferScan < fileSize && (bufferIsFree() || (bufferScan % Ctx::MEMORY_CHUNK_SIZE) > 0)
-                        && (!reachedZero || lastReadTime + static_cast<time_t>(ctx->redoReadSleepUs) < loopTime))
-                        if (!read1())
-                            break;
-
-                    if (numBlocksHeader != Ctx::ZERO_BLK && bufferEnd == static_cast<uint64_t>(numBlocksHeader) * blockSize) {
-                        if (nextScnHeader != Scn::none()) {
-                            ret = REDO_CODE::FINISHED;
-                            nextScn = nextScnHeader;
-                        } else {
-                            ctx->warning(60023, "file: " + fileName + " - position: " + std::to_string(bufferScan) +
-                                                " - unexpected end of file");
-                            ret = REDO_CODE::STOPPED;
-                        }
-                        break;
-                    }
-
-                    // Sleep some time
-                    if (!readBlocks) {
-                        if (readTime == 0) {
-                            contextSet(CONTEXT::SLEEP);
-                            usleep(ctx->redoReadSleepUs);
-                            contextSet(CONTEXT::CPU);
-                        } else {
-                            const time_ut nowTime = ctx->clock->getTimeUt();
-                            if (readTime > nowTime) {
-                                if (static_cast<time_ut>(ctx->redoReadSleepUs) < readTime - nowTime) {
-                                    contextSet(CONTEXT::SLEEP);
-                                    usleep(ctx->redoReadSleepUs);
-                                    contextSet(CONTEXT::CPU);
-                                } else {
-                                    contextSet(CONTEXT::SLEEP);
-                                    usleep(readTime - nowTime);
-                                    contextSet(CONTEXT::CPU);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                {
-                    contextSet(CONTEXT::MUTEX, REASON::READER_SLEEP2);
-                    std::unique_lock<std::mutex> const lck(mtx);
                     status = STATUS::SLEEPING;
                     condParserSleeping.notify_all();
                 }
@@ -815,21 +889,37 @@ namespace OpenLogReplicator {
         contextSet(CONTEXT::CPU);
     }
 
+    /**
+     * @brief 释放指定编号的读取缓冲区
+     * 
+     * 此函数用于释放 `redoBufferList` 中指定编号的缓冲区。它首先检查该缓冲区是否为空，
+     * 如果为空则直接返回。否则，将缓冲区指针置空并增加空闲缓冲区计数，最后调用
+     * `freeMemoryChunk` 释放内存。
+     * 
+     * @param t 指向当前线程的指针
+     * @param num 要释放的缓冲区编号
+     */
     void Reader::bufferFree(Thread* t, uint num) {
         uint8_t* buffer;
         {
+            // 设置上下文为互斥锁状态，表示正在进行缓冲区释放操作
             t->contextSet(CONTEXT::MUTEX, REASON::READER_FREE);
             std::unique_lock<std::mutex> const lck(mtx);
+            // 检查指定编号的缓冲区是否为空，如果为空则直接返回
             if (redoBufferList[num] == nullptr) {
                 t->contextSet(CONTEXT::CPU);
                 return;
             }
+            // 获取缓冲区指针，并将列表中的指针置空
             buffer = redoBufferList[num];
             redoBufferList[num] = nullptr;
+            // 增加空闲缓冲区计数
             ++ctx->bufferSizeFree;
         }
+        // 设置上下文为CPU状态，表示释放操作完成
         t->contextSet(CONTEXT::CPU);
 
+        // 调用上下文的内存管理函数释放缓冲区内存
         ctx->freeMemoryChunk(this, Ctx::MEMORY::READER, buffer);
     }
 
@@ -1081,54 +1171,100 @@ namespace OpenLogReplicator {
         bufferEnd = newBufferEnd.getData();
     }
 
+    /**
+     * @brief 检查重做日志文件的有效性
+     * 
+     * 此函数用于验证重做日志文件的格式和内容是否正确，并初始化相关状态。
+     * 它会设置读取器状态为检查模式，并等待解析器线程完成检查操作。
+     * 
+     * @return bool 返回检查结果，true表示检查成功，false表示检查失败
+     */
     bool Reader::checkRedoLog() {
+        // 设置上下文为互斥锁状态，表示进入关键代码段
         contextSet(CONTEXT::MUTEX, REASON::READER_CHECK_REDO);
+        // 获取互斥锁，保护共享资源访问
         std::unique_lock<std::mutex> lck(mtx);
+        // 设置读取器状态为检查模式
         status = STATUS::CHECK;
+        // 初始化序列号、起始SCN和下一个SCN为默认值
         sequence = Seq::zero();
         firstScn = Scn::none();
         nextScn = Scn::none();
+        // 通知所有等待缓冲区满条件的线程
         condBufferFull.notify_all();
+        // 通知所有等待读取器休眠条件的线程
         condReaderSleeping.notify_all();
-
+    
+        // 循环等待直到状态不再是检查模式
         while (status == STATUS::CHECK) {
+            // 如果系统正在关闭，则跳出循环
             if (ctx->softShutdown)
                 break;
+            // 如果启用了睡眠跟踪，则记录日志
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                 ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:checkRedoLog");
+            // 设置上下文为等待状态
             contextSet(CONTEXT::WAIT, REASON::READER_CHECK);
+            // 等待解析器线程完成检查操作
             condParserSleeping.wait(lck);
         }
+        // 恢复上下文为CPU执行状态
         contextSet(CONTEXT::CPU);
+        // 返回检查结果，OK表示成功
         return (ret == REDO_CODE::OK);
     }
 
+    /**
+     * @brief 更新Redo日志状态
+     * 
+     * 此函数用于更新Redo日志的状态。它会设置状态为UPDATE，并通知所有等待的条件变量。
+     * 然后进入一个循环，等待状态不再是UPDATE。如果检测到软关闭请求，则跳出循环。
+     * 如果返回码为EMPTY，则等待一段时间后继续循环。最后根据返回码决定是否返回成功。
+     * 
+     * @return bool 表示更新是否成功
+     */
     bool Reader::updateRedoLog() {
         for (;;) {
+            // 设置上下文为互斥锁状态，表示正在进行Redo日志更新操作
             contextSet(CONTEXT::MUTEX, REASON::READER_UPDATE_REDO1);
             std::unique_lock<std::mutex> lck(mtx);
+            // 设置状态为更新状态
             status = STATUS::UPDATE;
+            // 通知所有等待缓冲区满的线程
             condBufferFull.notify_all();
+            // 通知所有等待读取器休眠的线程
             condReaderSleeping.notify_all();
 
+            // 当状态为更新状态时，进入循环
             while (status == STATUS::UPDATE) {
+                // 如果检测到软关闭请求，则跳出循环
                 if (ctx->softShutdown)
                     break;
+                // 如果设置了跟踪休眠标志，则记录跟踪日志
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                     ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:updateRedoLog");
+                // 设置上下文为等待状态
                 contextSet(CONTEXT::WAIT);
+                // 等待解析器休眠条件变量
                 condParserSleeping.wait(lck);
+                // 重新设置上下文为互斥锁状态
                 contextSet(CONTEXT::MUTEX, REASON::READER_UPDATE_REDO2);
             }
 
+            // 如果返回码为EMPTY，则等待一段时间后继续循环
             if (ret == REDO_CODE::EMPTY) {
+                // 设置上下文为等待状态，并指定原因为读取器空
                 contextSet(CONTEXT::WAIT, REASON::READER_EMPTY);
+                // 等待指定的微秒数
                 condParserSleeping.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
+                // 重新设置上下文为互斥锁状态
                 contextSet(CONTEXT::MUTEX, REASON::READER_UPDATE_REDO3);
                 continue;
             }
 
+            // 设置上下文为CPU状态
             contextSet(CONTEXT::CPU);
+            // 根据返回码决定是否返回成功
             return (ret == REDO_CODE::OK);
         }
     }

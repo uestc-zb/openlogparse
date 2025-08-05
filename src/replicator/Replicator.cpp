@@ -1,22 +1,3 @@
-/* Thread reading database redo Logs using offline mode
-   Copyright (C) 2018-2025 Adam Leszczynski (aleszczynski@bersler.com)
-
-This file is part of OpenLogReplicator.
-
-OpenLogReplicator is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License as published
-by the Free Software Foundation; either version 3, or (at your option)
-any later version.
-
-OpenLogReplicator is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
-Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with OpenLogReplicator; see the file LICENSE;  If not see
-<http://www.gnu.org/licenses/>.  */
-
 #include <cerrno>
 #include <cstddef>
 #include <dirent.h>
@@ -42,6 +23,19 @@ along with OpenLogReplicator; see the file LICENSE;  If not see
 #include "Replicator.h"
 #include "ReplicatorRacOnline.h"
 namespace OpenLogReplicator {
+    /**
+     * @brief 复制器构造函数
+     * 
+     * 初始化复制器对象，设置上下文、日志获取函数、构建器、元数据、事务缓冲区、别名和数据库名称等成员变量。
+     * 
+     * @param newCtx 上下文对象指针
+     * @param newArchGetLog 归档日志获取函数指针
+     * @param newBuilder 构建器对象指针
+     * @param newMetadata 元数据对象指针
+     * @param newTransactionBuffer 事务缓冲区对象指针
+     * @param newAlias 复制器别名
+     * @param newDatabase 数据库名称
+     */
     Replicator::Replicator(Ctx* newCtx, void (* newArchGetLog)(Replicator* replicator), Builder* newBuilder, Metadata* newMetadata,
                            TransactionBuffer* newTransactionBuffer, std::string newAlias, std::string newDatabase) :
             Thread(newCtx, std::move(newAlias)),
@@ -50,6 +44,7 @@ namespace OpenLogReplicator {
             metadata(newMetadata),
             transactionBuffer(newTransactionBuffer),
             database(std::move(newDatabase)) {
+        // 设置解析器线程
         ctx->parserThread = this;
     }
 
@@ -80,7 +75,6 @@ namespace OpenLogReplicator {
             delete parser;
         }
     }
-
     void Replicator::updateOnlineLogs() {
         for (Parser* onlineRedo: onlineRedoSet) {
             if (!onlineRedo->reader->updateRedoLog())
@@ -118,10 +112,24 @@ namespace OpenLogReplicator {
         readers.clear();
     }
 
+
+    /**
+     * @brief 加载数据库元数据
+     * 
+     * 此函数用于初始化归档读取器，创建一个新的读取器实例用于处理归档日志。
+     * 通过调用 readerCreate(0) 创建一个组标识为0的读取器，通常用于处理归档日志。
+     */
     void Replicator::loadDatabaseMetadata() {
         archReader = readerCreate(0);
     }
 
+    /**
+     * @brief 定位读取器位置
+     * 
+     * 此函数用于设置读取器的起始序列号和文件偏移量。
+     * 如果元数据中指定了起始序列号，则使用该序列号和零偏移量；
+     * 否则使用零序列号和零偏移量作为起始位置。
+     */
     void Replicator::positionReader() {
         if (metadata->startSequence != Seq::none())
             metadata->setSeqFileOffset(metadata->startSequence, FileOffset::zero());
@@ -142,6 +150,7 @@ namespace OpenLogReplicator {
         throw RuntimeException(10040, "schema file missing");
     }
 
+
     void Replicator::updateOnlineRedoLogData() {
         int64_t lastGroup = -1;
         Reader* onlineReader = nullptr;
@@ -159,6 +168,7 @@ namespace OpenLogReplicator {
     }
 
     void Replicator::run() {
+        // 检查是否启用了线程跟踪，如果启用则记录复制器启动的日志信息
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::THREADS))) {
             std::ostringstream ss;
             ss << std::this_thread::get_id();
@@ -166,47 +176,67 @@ namespace OpenLogReplicator {
         }
 
         try {
+            // 等待写入器完成操作
             metadata->waitForWriter(ctx->parserThread);
 
+            // 加载数据库元数据
             loadDatabaseMetadata();
+            // 读取检查点信息
             metadata->readCheckpoints();
+            // 如果不是仅归档模式，则更新在线重做日志数据
             if (!ctx->isFlagSet(Ctx::REDO_FLAGS::ARCH_ONLY))
                 updateOnlineRedoLogData();
+            // 记录时区信息
             ctx->info(0, "timezone: " + Data::timezoneToString(-timezone) + ", db-timezone: " + Data::timezoneToString(metadata->dbTimezone) +
                          ", log-timezone: " + Data::timezoneToString(ctx->logTimezone) + ", host-timezone: " + Data::timezoneToString(ctx->hostTimezone));
 
+            // 进入主循环，等待元数据状态变为REPLICATE
             do {
+                // 检查是否需要软关闭
                 if (ctx->softShutdown)
                     break;
+                // 等待写入器完成操作
                 metadata->waitForWriter(ctx->parserThread);
 
+                // 如果元数据状态为READY，则继续下一次循环
                 if (metadata->status == Metadata::STATUS::READY)
                     continue;
 
+                // 再次检查是否需要软关闭
                 if (ctx->softShutdown)
                     break;
                 try {
+                    // 打印启动信息
                     printStartMsg();
+                    // 如果resetlogs不为0，则记录当前resetlogs值
                     if (metadata->resetlogs != 0)
                         ctx->info(0, "current resetlogs is: " + std::to_string(metadata->resetlogs));
+                    // 如果firstDataScn不为空，则记录first data SCN
                     if (metadata->firstDataScn != Scn::none())
                         ctx->info(0, "first data SCN: " + metadata->firstDataScn.toString());
+                    // 如果firstSchemaScn不为空，则记录first schema SCN
                     if (metadata->firstSchemaScn != Scn::none())
                         ctx->info(0, "first schema SCN: " + metadata->firstSchemaScn.toString());
 
+                    // 如果firstDataScn或sequence为空，则定位读取器
                     if (metadata->firstDataScn == Scn::none() || metadata->sequence == Seq::none())
                         positionReader();
 
-                    // No schema available?
+                    // 没有可用的schema?
                     if (metadata->schema->scn == Scn::none())
+                        // 创建schema
                         createSchema();
                     else
+                        // 允许检查点
                         metadata->allowCheckpoints();
+                    // 更新XML上下文
                     metadata->schema->updateXmlCtx();
 
+                    // 如果sequence为空，则抛出启动异常
                     if (metadata->sequence == Seq::none())
                         throw BootException(10028, "starting sequence is unknown");
 
+                    // 根据firstDataScn是否为空，记录最后确认的SCN、起始序列号和偏移量
                     if (metadata->firstDataScn == Scn::none())
                         ctx->info(0, "last confirmed scn: <none>, starting sequence: " + metadata->sequence.toString() + ", offset: " +
                                      metadata->fileOffset.toString());
@@ -214,6 +244,7 @@ namespace OpenLogReplicator {
                         ctx->info(0, "last confirmed scn: " + metadata->firstDataScn.toString() + ", starting sequence: " +
                                      metadata->sequence.toString() + ", offset: " + metadata->fileOffset.toString());
 
+                    // 如果数据库块校验和关闭且未禁用块校验和检查，则给出提示
                     if ((metadata->dbBlockChecksum == "OFF" || metadata->dbBlockChecksum == "FALSE") &&
                             !ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::BLOCK_SUM)) {
                         ctx->hint("set DB_BLOCK_CHECKSUM = TYPICAL on the database or turn off consistency checking in OpenLogReplicator "
@@ -222,17 +253,23 @@ namespace OpenLogReplicator {
                     }
 
                 } catch (BootException& ex) {
+                    // 如果未启用启动故障安全机制，则抛出运行时异常
                     if (!metadata->bootFailsafe)
                         throw RuntimeException(ex.code, ex.msg);
 
+                    // 记录错误信息
                     ctx->error(ex.code, ex.msg);
+                    // 记录复制启动失败信息，并等待进一步命令
                     ctx->info(0, "replication startup failed, waiting for further commands");
+                    // 设置元数据状态为就绪
                     metadata->setStatusReady(this);
+                    // 继续循环
                     continue;
                 }
 
-                // Boot succeeded
+                // 启动成功
                 ctx->info(0, "resume writer");
+                // 设置元数据状态为复制
                 metadata->setStatusReplicate(this);
             } while (metadata->status != Metadata::STATUS::REPLICATE);
 
@@ -287,13 +324,24 @@ namespace OpenLogReplicator {
         }
     }
 
+    /**
+     * @brief 创建或获取指定组的读取器实例
+     * 
+     * 此函数用于创建一个新的读取器实例或返回已存在的相同组的读取器。
+     * 
+     * @param group 读取器所属的组标识
+     * @return Reader* 返回创建或找到的读取器指针
+     */
     Reader* Replicator::readerCreate(int group) {
+        // 查找是否已存在相同组的读取器
         for (Reader* reader: readers)
             if (reader->getGroup() == group)
                 return reader;
 
         auto* replicator_rac = dynamic_cast<ReplicatorRacOnline*>(this);
         Reader* readerFS;
+        
+        // 根据是否使用ASM创建不同的读取器实例
         if (replicator_rac->getAsm()) {
             readerFS = new ReaderAsmFilesystem(ctx, alias + "-reader-" + std::to_string(group), database, group,
                                               metadata->dbBlockChecksum != "OFF" && metadata->dbBlockChecksum != "FALSE");
@@ -301,9 +349,12 @@ namespace OpenLogReplicator {
             readerFS = new ReaderFilesystem(ctx, alias + "-reader-" + std::to_string(group), database, group,
                                               metadata->dbBlockChecksum != "OFF" && metadata->dbBlockChecksum != "FALSE");
         }
+        
+        // 将新创建的读取器添加到读取器集合中并初始化
         readers.insert(readerFS);
         readerFS->initialize();
 
+        // 启动读取器线程
         ctx->spawnThread(readerFS);
         return readerFS;
     }
@@ -637,10 +688,25 @@ namespace OpenLogReplicator {
         return p1->sequence > p2->sequence;
     }
 
+    /**
+     * @brief 更新数据库的resetlogs信息
+     * 
+     * 此函数用于在数据库启动或日志处理过程中更新resetlogs信息。它会检查当前的resetlogs值是否与元数据中的值匹配，
+     * 如果不匹配，则查找新的resetlogs值并更新元数据。如果找不到匹配的resetlogs值，则抛出异常。
+     * 
+     * 主要步骤包括：
+     * 1. 获取元数据检查点的互斥锁。
+     * 2. 遍历数据库化身列表，查找与当前resetlogs值匹配的化身。
+     * 3. 如果resetlogs值发生变化，查找新的resetlogs值并更新元数据。
+     * 4. 如果数据库化身列表为空或找不到匹配的化身，则抛出异常。
+     */
     void Replicator::updateResetlogs() {
+        // 设置上下文为互斥锁状态，用于更新操作
         contextSet(CONTEXT::MUTEX, REASON::REPLICATOR_UPDATE);
+        // 获取元数据检查点的互斥锁，确保线程安全
         std::unique_lock<std::mutex> const lck(metadata->mtxCheckpoint);
 
+        // 遍历数据库化身列表，查找与当前resetlogs值匹配的化身
         for (DbIncarnation* oi: metadata->dbIncarnations) {
             if (oi->resetlogs == metadata->resetlogs) {
                 metadata->dbIncarnationCurrent = oi;
@@ -648,29 +714,36 @@ namespace OpenLogReplicator {
             }
         }
 
-        // Resetlogs is changed
+        // 检查resetlogs是否发生变化，如果发生变化则查找新的resetlogs值
         for (const DbIncarnation* oi: metadata->dbIncarnations) {
             if (oi->resetlogsScn == metadata->nextScn &&
                 metadata->dbIncarnationCurrent->resetlogs == metadata->resetlogs &&
                 oi->priorIncarnation == metadata->dbIncarnationCurrent->incarnation) {
+                // 记录新的resetlogs值
                 ctx->info(0, "new resetlogs detected: " + std::to_string(oi->resetlogs));
+                // 更新元数据中的resetlogs值
                 metadata->setResetlogs(oi->resetlogs);
+                // 重置序列号和文件偏移量
                 metadata->sequence = Seq::zero();
                 metadata->fileOffset = FileOffset::zero();
+                // 设置上下文为CPU状态
                 contextSet(CONTEXT::CPU);
                 return;
             }
         }
 
+        // 如果数据库化身列表为空，则直接返回
         if (metadata->dbIncarnations.empty()) {
             contextSet(CONTEXT::CPU);
             return;
         }
 
+        // 如果找不到匹配的化身，则抛出异常
         if (metadata->dbIncarnationCurrent == nullptr) {
             contextSet(CONTEXT::CPU);
             throw RuntimeException(10045, "resetlogs (" + std::to_string(metadata->resetlogs) + ") not found in incarnation list");
         }
+        // 设置上下文为CPU状态
         contextSet(CONTEXT::CPU);
     }
 
@@ -678,49 +751,76 @@ namespace OpenLogReplicator {
         metadata->wakeUp(this);
     }
 
+    /**
+     * @brief 打印复制器启动信息
+     * 
+     * 此函数用于在复制器启动时打印相关信息，包括数据库名称、运行模式、启动时间和序列号等。
+     * 根据元数据中的设置，启动信息可能包含绝对时间、相对时间或SCN（系统更改号）。
+     */
     void Replicator::printStartMsg() const {
+        // 初始化标志字符串
         std::string flagsStr;
         if (ctx->flags != 0)
             flagsStr = " (flags: " + std::to_string(ctx->flags) + ")";
 
+        // 确定启动时间信息
         std::string starting;
         if (!metadata->startTime.empty())
+            // 使用绝对时间
             starting = "time: " + metadata->startTime;
         else if (metadata->startTimeRel > 0)
+            // 使用相对时间
             starting = "time-rel: " + std::to_string(metadata->startTimeRel);
         else if (metadata->startScn != Scn::none())
+            // 使用SCN
             starting = "scn: " + metadata->startScn.toString();
         else
+            // 默认使用当前时间
             starting = "NOW";
 
+        // 确定起始序列号信息
         std::string startingSeq;
         if (metadata->startSequence != Seq::none())
             startingSeq = ", seq: " + metadata->startSequence.toString();
 
+        // 打印启动信息
         ctx->info(0, "Replicator for " + database + " in " + getModeName() + " mode is starting" + flagsStr + " from " + starting +
                      startingSeq);
     }
 
     bool Replicator::processArchivedRedoLogs() {
+        // 用于存储读取器返回码的变量
         Reader::REDO_CODE ret;
+        // 指向解析器对象的指针
         Parser* parser;
+        // 标记日志是否已被处理的布尔变量，初始值为false
         bool logsProcessed = false;
 
         while (!ctx->softShutdown) {
+            // 如果启用了REDO跟踪，则记录当前检查的归档日志序列号
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::REDO)))
                 ctx->logTrace(Ctx::TRACE::REDO, "checking archived redo logs, seq: " + metadata->sequence.toString());
+            // 更新resetlogs信息，确保读取器能够正确处理日志文件
             updateResetlogs();
+            // 获取归档日志文件，用于后续处理
             archGetLog(this);
 
+            // 检查归档重做日志队列是否为空
             if (archiveRedoQueue.empty()) {
+                // 如果设置了仅处理归档日志的标志
                 if (ctx->isFlagSet(Ctx::REDO_FLAGS::ARCH_ONLY)) {
+                    // 如果启用了归档列表跟踪，则记录日志信息
                     if (unlikely(ctx->isTraceSet(Ctx::TRACE::ARCHIVE_LIST)))
                         ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "archived redo log missing for seq: " + metadata->sequence.toString() +
                                                                 ", sleeping");
+                    // 设置上下文为睡眠状态
                     contextSet(CONTEXT::SLEEP);
+                    // 休眠指定的时间（微秒）
                     usleep(ctx->archReadSleepUs);
+                    // 恢复上下文为CPU状态
                     contextSet(CONTEXT::CPU);
                 } else {
+                    // 如果未设置仅处理归档日志的标志，则跳出循环
                     break;
                 }
             }
@@ -730,57 +830,86 @@ namespace OpenLogReplicator {
                 ss << std::this_thread::get_id();
                 ctx->logTrace(Ctx::TRACE::REDO, "searching archived redo log for seq: " + metadata->sequence.toString());
             }
+            // 循环处理归档重做日志队列中的文件，直到队列为空或接收到软关闭信号
             while (!archiveRedoQueue.empty() && !ctx->softShutdown) {
+                // 获取队列中优先级最高的解析器（通常是序列号最小的文件）
                 parser = archiveRedoQueue.top();
+                // 如果启用了REDO跟踪，则记录当前处理的文件路径、序列号和SCN
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::REDO)))
                     ctx->logTrace(Ctx::TRACE::REDO, parser->path + " is seq: " + parser->sequence.toString() + ", scn: " + parser->firstScn.toString());
 
-                // When no metadata exists, start processing from the first file
+                // 当没有元数据时，从第一个文件开始处理
                 if (metadata->sequence == Seq::zero()) {
+                    // 设置上下文为互斥锁状态，防止并发访问
                     contextSet(CONTEXT::MUTEX, REASON::REPLICATOR_ARCH);
+                    // 获取元数据检查点的互斥锁，确保线程安全
                     std::unique_lock<std::mutex> const lck(metadata->mtxCheckpoint);
+                    // 将元数据的序列号设置为当前解析器的序列号
                     metadata->sequence = parser->sequence;
+                    // 恢复上下文为CPU状态
                     contextSet(CONTEXT::CPU);
                 }
 
-                // Skip older archived redo logs
+                // 跳过序列号小于元数据序列号的旧归档重做日志
                 if (parser->sequence < metadata->sequence) {
+                    // 从队列中移除该解析器
                     archiveRedoQueue.pop();
+                    // 删除解析器对象以释放内存
                     delete parser;
+                    // 继续处理下一个文件
                     continue;
                 }
 
+                // 如果当前解析器的序列号大于元数据序列号，说明缺少中间的日志文件
                 if (parser->sequence > metadata->sequence) {
+                    // 记录警告信息，提示找不到指定序列号的归档日志
                     ctx->warning(60027, "couldn't find archive log for seq: " + metadata->sequence.toString() + ", found: " +
                                         parser->sequence.toString() + ", sleeping " + std::to_string(ctx->archReadSleepUs) + " us");
+                    // 设置上下文为休眠状态
                     contextSet(CONTEXT::SLEEP);
+                    // 休眠指定的时间，等待日志文件可用
                     usleep(ctx->archReadSleepUs);
+                    // 恢复上下文为CPU状态
                     contextSet(CONTEXT::CPU);
+                    // 清理归档日志列表
                     cleanArchList();
+                    // 再次尝试获取归档日志
                     archGetLog(this);
+                    // 继续处理下一个文件
                     continue;
                 }
 
+                // 标记日志已处理，并将解析器与归档读取器关联
                 logsProcessed = true;
                 parser->reader = archReader;
 
+                // 设置归档读取器要处理的文件名
                 archReader->fileName = parser->path;
+                // 获取最大重试次数
                 uint retry = ctx->archReadTries;
 
+                // 循环尝试打开并更新重做日志文件，直到成功或达到最大重试次数
                 while (true) {
+                    // 检查并更新重做日志文件，如果成功则跳出循环
                     if (archReader->checkRedoLog() && archReader->updateRedoLog()) {
                         break;
                     }
 
+                    // 如果重试次数已用完，则抛出异常
                     if (retry == 0)
                         throw RuntimeException(10009, "file: " + parser->path + " - failed to open after " +
                                                       std::to_string(ctx->archReadTries) + " tries");
 
+                    // 记录日志信息，提示文件尚未准备好读取
                     ctx->info(0, "archived redo log " + parser->path + " is not ready for read, sleeping " +
                                  std::to_string(ctx->archReadSleepUs) + " us");
+                    // 设置上下文为休眠状态
                     contextSet(CONTEXT::SLEEP);
+                    // 休眠指定时间
                     usleep(ctx->archReadSleepUs);
+                    // 恢复上下文为CPU状态
                     contextSet(CONTEXT::CPU);
+                    // 减少重试次数
                     --retry;
                 }
 
