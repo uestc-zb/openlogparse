@@ -1226,6 +1226,28 @@ namespace OpenLogReplicator {
         // 重置补充日志大小
         ctx->suppLogSize = 0;
 
+        // 如果读取器的起始缓冲区位置等于块大小的两倍（即从第3个块开始），则检查是否需要dump redo log
+        if (reader->getBufferStart() == FileOffset(2, reader->getBlockSize())) {
+            // 如果dumpRedoLog标志大于等于1，则执行dump操作
+            if (unlikely(ctx->dumpRedoLog >= 1)) {
+                // 构造dump文件名
+                const std::string fileName = ctx->dumpPath + "/" + sequence.toString() + ".olr";
+                // 打开dump文件
+                ctx->dumpStream->open(fileName);
+                // 如果文件打开失败，则记录错误并关闭dump功能
+                if (!ctx->dumpStream->is_open()) {
+                    ctx->error(10006, "file: " + fileName + " - open for writing returned: " + strerror(errno));
+                    ctx->warning(60012, "aborting log dump");
+                    ctx->dumpRedoLog = 0;
+                }
+                // 打印读取器头部信息并写入dump文件
+                std::ostringstream ss;
+                reader->printHeaderInfo(ss, path);
+                *ctx->dumpStream << ss.str();
+            }
+        }
+
+        // Continue started offset
         // 如果元数据中的文件偏移量大于零，则需要设置读取器的起始位置
         if (metadata->fileOffset > FileOffset::zero()) {
             // 检查偏移量是否与块大小对齐，如果不匹配则抛出异常
@@ -1235,7 +1257,10 @@ namespace OpenLogReplicator {
 
             // 获取偏移量对应的块号
             lwnConfirmedBlock = metadata->fileOffset.getBlock(reader->getBlockSize());
-
+            // 如果启用了检查点跟踪，则记录日志
+            if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                ctx->logTrace(Ctx::TRACE::CHECKPOINT, "setting reader start position to " + metadata->fileOffset.toString() + " (block " +
+                                                      std::to_string(lwnConfirmedBlock) + ")");
             // 重置元数据中的文件偏移量
             metadata->fileOffset = FileOffset::zero();
         }
@@ -1245,6 +1270,11 @@ namespace OpenLogReplicator {
 
         // 记录当前处理的重做日志文件名和缓冲区起始偏移量信息
         ctx->info(0, "processing redo log: " + toString() + " offset: " + reader->getBufferStart().toString());
+        // 如果启用了自适应模式且模式尚未加载，同时版本字符串不为空，则加载自适应模式
+        if (ctx->isFlagSet(Ctx::REDO_FLAGS::ADAPTIVE_SCHEMA) && !metadata->schema->loaded && !ctx->versionStr.empty()) {
+            metadata->loadAdaptiveSchema();
+            metadata->schema->loaded = true;
+        }
 
         // 如果元数据中的resetlogs为0，则设置为读取器中的resetlogs值
         if (metadata->resetlogs == 0)
@@ -1324,6 +1354,12 @@ namespace OpenLogReplicator {
                         // 读取LWN时间戳
                         lwnTimestamp = ctx->read32(redoBlock + blockOffset + 64U);
 
+                        // 如果启用了指标收集，计算并发送检查点延迟
+                        if (ctx->metrics != nullptr) {
+                            const int64_t diff = ctx->clock->getTimeT() - lwnTimestamp.toEpoch(ctx->hostTimezone);
+                            ctx->metrics->emitCheckpointLag(diff);
+                        }
+
                         // 如果是第一个LWN块
                         if (lwnNumCnt == 0) {
                             // 记录检查点开始块号
@@ -1342,6 +1378,13 @@ namespace OpenLogReplicator {
                         }
                         // 增加已处理的LWN块计数
                         ++lwnNumCnt;
+
+                        // 如果启用了LWN跟踪，记录相关信息
+                        if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN))) {
+                            const typeBlk lwnStartBlock = currentBlock;
+                            ctx->logTrace(Ctx::TRACE::LWN, "at: " + std::to_string(lwnStartBlock) + " size: " + std::to_string(lwnSize) +
+                                                           " chk: " + std::to_string(lwnNum) + " max: " + std::to_string(lwnNumMax));
+                        }
                     } else
                         // 如果未找到有效的LWN块，抛出异常
                         throw RedoLogException(50051, "did not find lwn at offset: " + confirmedBufferStart.toString());
@@ -1392,6 +1435,11 @@ namespace OpenLogReplicator {
                             lwnMember->block = currentBlock;
                             lwnMember->subScn = ctx->read16(redoBlock + blockOffset + 12U);
 
+                            // 如果启用了LWN跟踪，记录相关信息
+                            if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
+                                ctx->logTrace(Ctx::TRACE::LWN, "size: " + std::to_string(recordSize4) + " scn: " +
+                                                               lwnMember->scn.toString() + " subscn: " + std::to_string(lwnMember->subScn));
+
                             // 将新记录插入到LWN记录堆中
                             uint64_t lwnPos = ++lwnRecords;
                             if (unlikely(lwnPos >= MAX_RECORDS_IN_LWN))
@@ -1435,10 +1483,19 @@ namespace OpenLogReplicator {
                 confirmedBufferStart += reader->getBlockSize();
                 redoBufferPos += reader->getBlockSize();
 
+                // 检查点处理
+                // 如果启用了LWN跟踪，记录检查点信息
+                if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
+                    ctx->logTrace(Ctx::TRACE::LWN, "checkpoint at " + std::to_string(currentBlock) + "/" + std::to_string(lwnEndBlock) +
+                                                   " num: " + std::to_string(lwnNumCnt) + "/" + std::to_string(lwnNumMax));
                 // 如果到达LWN结束块且已处理完所有LWN块
                 if (currentBlock == lwnEndBlock && lwnNumCnt == lwnNumMax) {
                     // 清空最后处理的事务
                     lastTransaction = nullptr;
+
+                    // 如果启用了LWN跟踪，记录分析信息
+                    if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
+                        ctx->logTrace(Ctx::TRACE::LWN, "* analyze: " + lwnScn.toString());
 
                     // 分析LWN记录堆中的所有记录
                     while (lwnRecords > 0) {
@@ -1493,6 +1550,9 @@ namespace OpenLogReplicator {
 
                     // 如果LWN的SCN大于元数据中的第一个数据SCN，执行检查点处理
                     if (lwnScn > metadata->firstDataScn) {
+                        // 如果启用了检查点跟踪，记录相关信息
+                        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "on: " + lwnScn.toString());
                         // 处理检查点
                         builder->processCheckpoint(lwnScn, sequence, lwnTimestamp.toEpoch(ctx->hostTimezone),
                                                    FileOffset(currentBlock, reader->getBlockSize()), switchRedo);
@@ -1502,6 +1562,9 @@ namespace OpenLogReplicator {
                         FileOffset minFileOffset;
                         Xid minXid;
                         transactionBuffer->checkpoint(minSequence, minFileOffset, minXid);
+                        // 如果启用了LWN跟踪，记录检查点信息
+                        if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
+                            ctx->logTrace(Ctx::TRACE::LWN, "* checkpoint: " + lwnScn.toString());
                         // 更新元数据检查点
                         metadata->checkpoint(ctx->parserThread, lwnScn, lwnTimestamp, sequence, FileOffset(currentBlock, reader->getBlockSize()),
                                              static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize(), minSequence,
@@ -1515,11 +1578,22 @@ namespace OpenLogReplicator {
                                 ctx->stopSoft();
                             }
                         }
+                        // 如果启用了指标收集，发送检查点输出计数
+                        if (ctx->metrics != nullptr)
+                            ctx->metrics->emitCheckpointsOut(1);
+                    } else {
+                        // 如果SCN不大于第一个数据SCN，发送检查点跳过计数
+                        if (ctx->metrics != nullptr)
+                            ctx->metrics->emitCheckpointsSkip(1);
                     }
 
                     // 重置LWN计数器并释放LWN内存
                     lwnNumCnt = 0;
                     freeLwn();
+
+                    // 如果启用了指标收集，发送已解析字节数
+                    if (ctx->metrics != nullptr)
+                        ctx->metrics->emitBytesParsed((currentBlock - lwnConfirmedBlock) * reader->getBlockSize());
                     // 更新已确认的块号
                     lwnConfirmedBlock = currentBlock;
                 } else if (unlikely(lwnNumCnt > lwnNumMax))
@@ -1542,17 +1616,34 @@ namespace OpenLogReplicator {
                 if (lwnScn > metadata->firstDataScn) {
                     // 设置切换重做日志标志
                     switchRedo = true;
+                    // 如果启用了检查点跟踪，记录相关信息
+                    if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                        ctx->logTrace(Ctx::TRACE::CHECKPOINT, "on: " + lwnScn.toString() + " with switch");
                     // 处理检查点
                     builder->processCheckpoint(lwnScn, sequence, lwnTimestamp.toEpoch(ctx->hostTimezone),
                                                FileOffset(currentBlock, reader->getBlockSize()), switchRedo);
+                    // 如果启用了指标收集，发送检查点输出计数
+                    if (ctx->metrics != nullptr)
+                        ctx->metrics->emitCheckpointsOut(1);
+                } else {
+                    // 如果SCN不大于第一个数据SCN，发送检查点跳过计数
+                    if (ctx->metrics != nullptr)
+                        ctx->metrics->emitCheckpointsSkip(1);
                 }
             }
 
             // 如果收到软关闭信号
             if (ctx->softShutdown) {
+                // 如果启用了检查点跟踪，记录相关信息
+                if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                    ctx->logTrace(Ctx::TRACE::CHECKPOINT, "on: " + lwnScn.toString() + " at exit");
                 // 处理检查点
                 builder->processCheckpoint(lwnScn, sequence, lwnTimestamp.toEpoch(ctx->hostTimezone),
                                            FileOffset(currentBlock, reader->getBlockSize()), false);
+                // 如果启用了指标收集，发送检查点输出计数
+                if (ctx->metrics != nullptr)
+                    ctx->metrics->emitCheckpointsOut(1);
+
                 // 设置读取器返回状态为关闭
                 reader->setRet(Reader::REDO_CODE::SHUTDOWN);
             } else {
@@ -1568,6 +1659,58 @@ namespace OpenLogReplicator {
                     break;
                 }
             }
+        }
+
+        if (ctx->metrics != nullptr && reader->getNextScn() != Scn::none()) {
+            const int64_t diff = ctx->clock->getTimeT() - reader->getNextTime().toEpoch(ctx->hostTimezone);
+
+            if (group == 0) {
+                ctx->metrics->emitLogSwitchesArchived(1);
+                ctx->metrics->emitLogSwitchesLagArchived(diff);
+            } else {
+                ctx->metrics->emitLogSwitchesOnline(1);
+                ctx->metrics->emitLogSwitchesLagOnline(diff);
+            }
+        }
+
+        // Print performance information
+        if (ctx->isTraceSet(Ctx::TRACE::PERFORMANCE)) {
+            const time_ut cEnd = ctx->clock->getTimeUt();
+            double suppLogPercent = 0.0;
+            if (currentBlock != startBlock)
+                suppLogPercent = 100.0 * ctx->suppLogSize / (static_cast<double>(currentBlock - startBlock) * reader->getBlockSize());
+
+            if (group == 0) {
+                double mySpeed = 0;
+                const double myTime = static_cast<double>(cEnd - cStart) / 1000.0;
+                if (myTime > 0)
+                    mySpeed = static_cast<double>(currentBlock - startBlock) * reader->getBlockSize() * 1000.0 / 1024 / 1024 / myTime;
+
+                double myReadSpeed = 0;
+                if (reader->getSumTime() > 0)
+                    myReadSpeed = (static_cast<double>(reader->getSumRead()) * 1000000.0 / 1024 / 1024 / static_cast<double>(reader->getSumTime()));
+
+                ctx->logTrace(Ctx::TRACE::PERFORMANCE, std::to_string(myTime) + " ms, " +
+                                                       "Speed: " + std::to_string(mySpeed) + " MB/s, " +
+                                                       "Redo log size: " + std::to_string(static_cast<uint64_t>(currentBlock - startBlock) *
+                                                                                          reader->getBlockSize() / 1024 / 1024) +
+                                                       " MB, Read size: " + std::to_string(reader->getSumRead() / 1024 / 1024) + " MB, " +
+                                                       "Read speed: " + std::to_string(myReadSpeed) + " MB/s, " +
+                                                       "Max LWN size: " + std::to_string(lwnAllocatedMax) + ", " +
+                                                       "Supplemental redo log size: " + std::to_string(ctx->suppLogSize) + " bytes " +
+                                                       "(" + std::to_string(suppLogPercent) + " %)");
+            } else {
+                ctx->logTrace(Ctx::TRACE::PERFORMANCE, "Redo log size: " + std::to_string(static_cast<uint64_t>(currentBlock - startBlock) *
+                                                                                          reader->getBlockSize() / 1024 / 1024) + " MB, " +
+                                                       "Max LWN size: " + std::to_string(lwnAllocatedMax) + ", " +
+                                                       "Supplemental redo log size: " + std::to_string(ctx->suppLogSize) + " bytes " +
+                                                       "(" + std::to_string(suppLogPercent) + " %)");
+            }
+        }
+
+        if (ctx->dumpRedoLog >= 1 && ctx->dumpStream->is_open()) {
+            *ctx->dumpStream << "END OF REDO DUMP\n";
+            ctx->dumpStream->close();
         }
 
         builder->flush();
