@@ -74,12 +74,22 @@ namespace OpenLogReplicator {
         lwnMembers[0] = nullptr;
     }
 
+    /**
+     * Parser析构函数
+     * 释放所有已分配的LWN(日志写入号)内存块
+     * 确保在对象销毁时正确释放资源，防止内存泄漏
+     */
     Parser::~Parser() {
         while (lwnAllocated > 0) {
             ctx->freeMemoryChunk(ctx->parserThread, Ctx::MEMORY::PARSER, lwnChunks[--lwnAllocated]);
         }
     }
 
+    /**
+     * 释放LWN(日志写入号)内存块
+     * 保留第一个内存块并重置其大小，释放其余所有已分配的内存块
+     * 用于在处理完日志数据后释放临时分配的内存资源
+     */
     void Parser::freeLwn() {
         while (lwnAllocated > 1) {
             ctx->freeMemoryChunk(ctx->parserThread, Ctx::MEMORY::PARSER, lwnChunks[--lwnAllocated]);
