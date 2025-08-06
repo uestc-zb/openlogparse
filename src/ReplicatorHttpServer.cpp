@@ -154,7 +154,7 @@ namespace ReplicatorHttpServer {
         
         // 创建和配置HTTP服务器（新版本非阻塞式实现）
         httpServer = new hv::HttpServer(&router);  // 创建HTTP服务器实例
-        httpServer->setPort(8078);                 // 设置端口号为8078
+        httpServer->setPort(8079);                 // 设置端口号为8078
         httpServer->setThreadNum(4);               // 设置线程数为4
         
         // 修改为检查标志的循环，实现非阻塞式服务器运行

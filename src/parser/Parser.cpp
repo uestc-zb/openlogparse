@@ -1,22 +1,3 @@
-/* Class with main redo log parser
-   Copyright (C) 2018-2025 Adam Leszczynski (aleszczynski@bersler.com)
-
-This file is part of OpenLogReplicator.
-
-OpenLogReplicator is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License as published
-by the Free Software Foundation; either version 3, or (at your option)
-any later version.
-
-OpenLogReplicator is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
-Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with OpenLogReplicator; see the file LICENSE;  If not see
-<http://www.gnu.org/licenses/>.  */
-
 #include <algorithm>
 #include <utility>
 
@@ -1233,153 +1214,177 @@ namespace OpenLogReplicator {
     }
 
     Reader::REDO_CODE Parser::parse() {
+        // 初始化LWN确认块号为2，LWN记录数为0
         typeBlk lwnConfirmedBlock = 2;
         uint64_t lwnRecords = 0;
 
+        // 如果firstScn和nextScn未设置，且读取器获取到的firstScn不为零，则设置firstScn和nextScn
         if (firstScn == Scn::none() && nextScn == Scn::none() && reader->getFirstScn() != Scn::zero()) {
             firstScn = reader->getFirstScn();
             nextScn = reader->getNextScn();
         }
+        // 重置补充日志大小
         ctx->suppLogSize = 0;
 
-        if (reader->getBufferStart() == FileOffset(2, reader->getBlockSize())) {
-            if (unlikely(ctx->dumpRedoLog >= 1)) {
-                const std::string fileName = ctx->dumpPath + "/" + sequence.toString() + ".olr";
-                ctx->dumpStream->open(fileName);
-                if (!ctx->dumpStream->is_open()) {
-                    ctx->error(10006, "file: " + fileName + " - open for writing returned: " + strerror(errno));
-                    ctx->warning(60012, "aborting log dump");
-                    ctx->dumpRedoLog = 0;
-                }
-                std::ostringstream ss;
-                reader->printHeaderInfo(ss, path);
-                *ctx->dumpStream << ss.str();
-            }
-        }
-
-        // Continue started offset
+        // 如果元数据中的文件偏移量大于零，则需要设置读取器的起始位置
         if (metadata->fileOffset > FileOffset::zero()) {
+            // 检查偏移量是否与块大小对齐，如果不匹配则抛出异常
             if (unlikely(!metadata->fileOffset.matchesBlockSize(reader->getBlockSize())))
                 throw RedoLogException(50047, "incorrect offset start: " + metadata->fileOffset.toString() +
                                               " - not a multiplication of block size: " + std::to_string(reader->getBlockSize()));
 
+            // 获取偏移量对应的块号
             lwnConfirmedBlock = metadata->fileOffset.getBlock(reader->getBlockSize());
-            if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
-                ctx->logTrace(Ctx::TRACE::CHECKPOINT, "setting reader start position to " + metadata->fileOffset.toString() + " (block " +
-                                                      std::to_string(lwnConfirmedBlock) + ")");
+
+            // 重置元数据中的文件偏移量
             metadata->fileOffset = FileOffset::zero();
         }
+        // 设置读取器的缓冲区起始和结束位置
         reader->setBufferStartEnd(FileOffset(lwnConfirmedBlock, reader->getBlockSize()),
                                   FileOffset(lwnConfirmedBlock, reader->getBlockSize()));
 
+        // 记录当前处理的重做日志文件名和缓冲区起始偏移量信息
         ctx->info(0, "processing redo log: " + toString() + " offset: " + reader->getBufferStart().toString());
-        if (ctx->isFlagSet(Ctx::REDO_FLAGS::ADAPTIVE_SCHEMA) && !metadata->schema->loaded && !ctx->versionStr.empty()) {
-            metadata->loadAdaptiveSchema();
-            metadata->schema->loaded = true;
-        }
 
+        // 如果元数据中的resetlogs为0，则设置为读取器中的resetlogs值
         if (metadata->resetlogs == 0)
             metadata->setResetlogs(reader->getResetlogs());
 
+        // 检查元数据中的resetlogs是否与读取器中的resetlogs匹配，不匹配则抛出异常
         if (unlikely(metadata->resetlogs != reader->getResetlogs()))
             throw RedoLogException(50048, "invalid resetlogs value (found: " + std::to_string(reader->getResetlogs()) + ", expected: " +
                                           std::to_string(metadata->resetlogs) + "): " + reader->fileName);
 
+        // 检查读取器中的激活值，如果不为0且与元数据中的激活值不同(或元数据中激活值为0)，则更新元数据中的激活值
         if (reader->getActivation() != 0 && (metadata->activation == 0 || metadata->activation != reader->getActivation())) {
             ctx->info(0, "new activation detected: " + std::to_string(reader->getActivation()));
             metadata->setActivation(reader->getActivation());
         }
 
+        // 获取当前时间，用于性能统计
         const time_ut cStart = ctx->clock->getTimeUt();
+        // 设置读取器状态为读取中
         reader->setStatusRead();
+        // 声明LWN成员指针，用于指向当前处理的日志记录
         LwnMember* lwnMember;
+        // 声明块内偏移量变量
         uint16_t blockOffset;
+        // 获取并保存确认的缓冲区起始位置
         FileOffset confirmedBufferStart = reader->getBufferStart();
+        // 初始化记录位置计数器
         uint64_t recordPos = 0;
+        // 声明记录大小变量(4字节对齐)
         uint32_t recordSize4;
+        // 初始化剩余待复制的记录大小
         uint32_t recordLeftToCopy = 0;
+        // 保存起始块号，用于比较
         const typeBlk startBlock = lwnConfirmedBlock;
+        // 初始化当前块号
         typeBlk currentBlock = lwnConfirmedBlock;
+        // 初始化LWN结束块号
         typeBlk lwnEndBlock = lwnConfirmedBlock;
+        // 初始化LWN最大编号
         typeLwn lwnNumMax = 0;
+        // 初始化LWN编号计数器
         typeLwn lwnNumCnt = 0;
+        // 设置检查点块号为已确认块号
         lwnCheckpointBlock = lwnConfirmedBlock;
+        // 初始化重做日志切换标志
         bool switchRedo = false;
 
+        // 主循环：持续处理重做日志，直到收到软关闭信号
         while (!ctx->softShutdown) {
-            // There is some work to do
+            // 内层循环：处理已确认的缓冲区数据
             while (confirmedBufferStart < reader->getBufferEnd()) {
+                // 计算当前块在内存缓冲区中的位置
                 uint64_t redoBufferPos = (static_cast<uint64_t>(currentBlock) * reader->getBlockSize()) % Ctx::MEMORY_CHUNK_SIZE;
+                // 计算当前块所属的缓冲区编号
                 const uint64_t redoBufferNum =
                         ((static_cast<uint64_t>(currentBlock) * reader->getBlockSize()) / Ctx::MEMORY_CHUNK_SIZE) % ctx->memoryChunksReadBufferMax;
+                // 获取当前块的数据指针
                 const uint8_t* redoBlock = reader->redoBufferList[redoBufferNum] + redoBufferPos;
 
+                // 设置块内偏移量起始位置为16字节（跳过块头）
                 blockOffset = 16U;
-                // New LWN block
+                // 检查是否到达新的LWN（日志写入号）块
                 if (currentBlock == lwnEndBlock) {
+                    // 读取块有效性标志
                     const uint8_t vld = redoBlock[blockOffset + 4U];
 
+                    // 检查块是否有效（第3位为1表示有效）
                     if (likely((vld & 0x04) != 0)) {
+                        // 读取LWN编号
                         const uint16_t lwnNum = ctx->read16(redoBlock + blockOffset + 24U);
+                        // 读取LWN块大小
                         const uint32_t lwnSize = ctx->read32(redoBlock + blockOffset + 28U);
+                        // 更新LWN结束块号
                         lwnEndBlock = currentBlock + lwnSize;
+                        // 读取LWN的SCN（系统变更号）
                         lwnScn = ctx->readScn(redoBlock + blockOffset + 40U);
+                        // 读取LWN时间戳
                         lwnTimestamp = ctx->read32(redoBlock + blockOffset + 64U);
 
-                        if (ctx->metrics != nullptr) {
-                            const int64_t diff = ctx->clock->getTimeT() - lwnTimestamp.toEpoch(ctx->hostTimezone);
-                            ctx->metrics->emitCheckpointLag(diff);
-                        }
-
+                        // 如果是第一个LWN块
                         if (lwnNumCnt == 0) {
+                            // 记录检查点开始块号
                             lwnCheckpointBlock = currentBlock;
+                            // 读取最大LWN编号
                             lwnNumMax = ctx->read16(redoBlock + blockOffset + 26U);
-                            // Verify LWN header start
+                            // 验证LWN头的SCN是否有效
                             if (unlikely(lwnScn < reader->getFirstScn() || (lwnScn > reader->getNextScn() && reader->getNextScn() != Scn::none())))
                                 throw RedoLogException(50049, "invalid lwn scn: " + lwnScn.toString());
                         } else {
+                            // 对于后续LWN块，检查当前编号是否与最大编号一致
                             const typeLwn lwnNumCur = ctx->read16(redoBlock + blockOffset + 26U);
                             if (unlikely(lwnNumCur != lwnNumMax))
                                 throw RedoLogException(50050, "invalid lwn max: " + std::to_string(lwnNum) + "/" +
                                                               std::to_string(lwnNumCur) + "/" + std::to_string(lwnNumMax));
                         }
+                        // 增加已处理的LWN块计数
                         ++lwnNumCnt;
-
-                        if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN))) {
-                            const typeBlk lwnStartBlock = currentBlock;
-                            ctx->logTrace(Ctx::TRACE::LWN, "at: " + std::to_string(lwnStartBlock) + " size: " + std::to_string(lwnSize) +
-                                                           " chk: " + std::to_string(lwnNum) + " max: " + std::to_string(lwnNumMax));
-                        }
                     } else
+                        // 如果未找到有效的LWN块，抛出异常
                         throw RedoLogException(50051, "did not find lwn at offset: " + confirmedBufferStart.toString());
                 }
 
+                // 处理当前块中的所有记录
                 while (blockOffset < reader->getBlockSize()) {
-                    // Next record
+                    // 如果当前记录已完全复制，准备处理下一个记录
                     if (recordLeftToCopy == 0) {
+                        // 如果剩余空间不足20字节（记录头大小），则跳过
                         if (blockOffset + 20U >= reader->getBlockSize())
                             break;
 
+                        // 读取记录大小并进行4字节对齐
                         recordSize4 = (static_cast<uint64_t>(ctx->read32(redoBlock + blockOffset)) + 3U) & 0xFFFFFFFC;
                         if (recordSize4 > 0) {
+                            // 获取当前LWN块的大小指针
                             auto* recordSize = reinterpret_cast<uint64_t*>(lwnChunks[lwnAllocated - 1]);
 
+                            // 检查当前块是否已满，需要分配新的内存块
                             if (((*recordSize + sizeof(struct LwnMember) + recordSize4 + 7) & 0xFFFFFFF8) > Ctx::MEMORY_CHUNK_SIZE_MB * 1024 * 1024) {
+                                // 如果已达到最大块数限制，抛出异常
                                 if (unlikely(lwnAllocated == MAX_LWN_CHUNKS))
                                     throw RedoLogException(50052, "all " + std::to_string(MAX_LWN_CHUNKS) + " lwn buffers allocated");
 
+                                // 分配新的内存块
                                 lwnChunks[lwnAllocated++] = ctx->getMemoryChunk(ctx->parserThread, Ctx::MEMORY::PARSER);
                                 ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
                                 lwnAllocatedMax = std::max(lwnAllocated, lwnAllocatedMax);
+                                // 更新记录大小指针
                                 recordSize = reinterpret_cast<uint64_t*>(lwnChunks[lwnAllocated - 1]);
                                 *recordSize = sizeof(uint64_t);
                             }
 
+                            // 检查记录大小是否超过限制
                             if (unlikely(((*recordSize + sizeof(struct LwnMember) + recordSize4 + 7) & 0xFFFFFFF8) > Ctx::MEMORY_CHUNK_SIZE_MB * 1024 * 1024))
                                 throw RedoLogException(50053, "too big redo log record, size: " + std::to_string(recordSize4));
 
+                            // 创建新的LWN成员结构
                             lwnMember = reinterpret_cast<struct LwnMember*>(lwnChunks[lwnAllocated - 1] + *recordSize);
+                            // 更新记录大小
                             *recordSize += (sizeof(struct LwnMember) + recordSize4 + 7) & 0xFFFFFFF8;
+                            // 设置LWN成员属性
                             lwnMember->pageOffset = blockOffset;
                             lwnMember->scn = ctx->read32(redoBlock + blockOffset + 8U) |
                                              (static_cast<uint64_t>(ctx->read16(redoBlock + blockOffset + 6U)) << 32);
@@ -1387,14 +1392,12 @@ namespace OpenLogReplicator {
                             lwnMember->block = currentBlock;
                             lwnMember->subScn = ctx->read16(redoBlock + blockOffset + 12U);
 
-                            if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
-                                ctx->logTrace(Ctx::TRACE::LWN, "size: " + std::to_string(recordSize4) + " scn: " +
-                                                               lwnMember->scn.toString() + " subscn: " + std::to_string(lwnMember->subScn));
-
+                            // 将新记录插入到LWN记录堆中
                             uint64_t lwnPos = ++lwnRecords;
                             if (unlikely(lwnPos >= MAX_RECORDS_IN_LWN))
                                 throw RedoLogException(50054, "all " + std::to_string(lwnPos) + " records in lwn were used");
 
+                            // 维护堆的有序性
                             while (lwnPos > 1 && *lwnMember < *lwnMembers[lwnPos / 2]) {
                                 lwnMembers[lwnPos] = lwnMembers[lwnPos / 2];
                                 lwnPos /= 2;
@@ -1402,51 +1405,55 @@ namespace OpenLogReplicator {
                             lwnMembers[lwnPos] = lwnMember;
                         }
 
+                        // 设置待复制记录的剩余大小和当前位置
                         recordLeftToCopy = recordSize4;
                         recordPos = 0;
                     }
 
-                    // Nothing more
+                    // 如果没有更多数据需要复制，跳出循环
                     if (recordLeftToCopy == 0)
                         break;
 
+                    // 计算本次需要复制的数据量
                     uint32_t toCopy;
                     if (blockOffset + recordLeftToCopy > reader->getBlockSize())
                         toCopy = reader->getBlockSize() - blockOffset;
                     else
                         toCopy = recordLeftToCopy;
 
+                    // 执行数据复制
                     memcpy(reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(lwnMember) + sizeof(struct LwnMember) + recordPos),
                            reinterpret_cast<const void*>(redoBlock + blockOffset), toCopy);
+                    // 更新剩余待复制数据量和位置
                     recordLeftToCopy -= toCopy;
                     blockOffset += toCopy;
                     recordPos += toCopy;
                 }
 
+                // 更新当前块号和已确认的缓冲区位置
                 ++currentBlock;
                 confirmedBufferStart += reader->getBlockSize();
                 redoBufferPos += reader->getBlockSize();
 
-                // Checkpoint
-                if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
-                    ctx->logTrace(Ctx::TRACE::LWN, "checkpoint at " + std::to_string(currentBlock) + "/" + std::to_string(lwnEndBlock) +
-                                                   " num: " + std::to_string(lwnNumCnt) + "/" + std::to_string(lwnNumMax));
+                // 如果到达LWN结束块且已处理完所有LWN块
                 if (currentBlock == lwnEndBlock && lwnNumCnt == lwnNumMax) {
+                    // 清空最后处理的事务
                     lastTransaction = nullptr;
 
-                    if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
-                        ctx->logTrace(Ctx::TRACE::LWN, "* analyze: " + lwnScn.toString());
-
+                    // 分析LWN记录堆中的所有记录
                     while (lwnRecords > 0) {
                         try {
+                            // 分析堆顶记录
                             analyzeLwn(lwnMembers[1]);
                         } catch (DataException& ex) {
+                            // 处理数据异常
                             if (ctx->isFlagSet(Ctx::REDO_FLAGS::IGNORE_DATA_ERRORS)) {
                                 ctx->error(ex.code, ex.msg);
                                 ctx->warning(60013, "forced to continue working in spite of error");
                             } else
                                 throw DataException(ex.code, "runtime error, aborting further redo log processing: " + ex.msg);
                         } catch (RedoLogException& ex) {
+                            // 处理重做日志异常
                             if (ctx->isFlagSet(Ctx::REDO_FLAGS::IGNORE_DATA_ERRORS)) {
                                 ctx->error(ex.code, ex.msg);
                                 ctx->warning(60013, "forced to continue working in spite of error");
@@ -1454,11 +1461,13 @@ namespace OpenLogReplicator {
                                 throw RedoLogException(ex.code, "runtime error, aborting further redo log processing: " + ex.msg);
                         }
 
+                        // 如果只剩一个记录，清空记录数并跳出循环
                         if (lwnRecords == 1) {
                             lwnRecords = 0;
                             break;
                         }
 
+                        // 重新维护堆的有序性
                         uint64_t lwnPos = 1;
                         while (true) {
                             if (lwnPos * 2U < lwnRecords && *lwnMembers[lwnPos * 2U] < *lwnMembers[lwnRecords]) {
@@ -1482,22 +1491,23 @@ namespace OpenLogReplicator {
                         --lwnRecords;
                     }
 
+                    // 如果LWN的SCN大于元数据中的第一个数据SCN，执行检查点处理
                     if (lwnScn > metadata->firstDataScn) {
-                        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
-                            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "on: " + lwnScn.toString());
+                        // 处理检查点
                         builder->processCheckpoint(lwnScn, sequence, lwnTimestamp.toEpoch(ctx->hostTimezone),
                                                    FileOffset(currentBlock, reader->getBlockSize()), switchRedo);
 
+                        // 执行事务缓冲区检查点
                         Seq minSequence = Seq::none();
                         FileOffset minFileOffset;
                         Xid minXid;
                         transactionBuffer->checkpoint(minSequence, minFileOffset, minXid);
-                        if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
-                            ctx->logTrace(Ctx::TRACE::LWN, "* checkpoint: " + lwnScn.toString());
+                        // 更新元数据检查点
                         metadata->checkpoint(ctx->parserThread, lwnScn, lwnTimestamp, sequence, FileOffset(currentBlock, reader->getBlockSize()),
                                              static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize(), minSequence,
                                              minFileOffset, minXid);
 
+                        // 检查是否需要关闭系统
                         if (ctx->stopCheckpoints > 0 && metadata->isNewData(lwnScn, builder->lwnIdx)) {
                             --ctx->stopCheckpoints;
                             if (ctx->stopCheckpoints == 0) {
@@ -1505,115 +1515,59 @@ namespace OpenLogReplicator {
                                 ctx->stopSoft();
                             }
                         }
-                        if (ctx->metrics != nullptr)
-                            ctx->metrics->emitCheckpointsOut(1);
-                    } else {
-                        if (ctx->metrics != nullptr)
-                            ctx->metrics->emitCheckpointsSkip(1);
                     }
 
+                    // 重置LWN计数器并释放LWN内存
                     lwnNumCnt = 0;
                     freeLwn();
-
-                    if (ctx->metrics != nullptr)
-                        ctx->metrics->emitBytesParsed((currentBlock - lwnConfirmedBlock) * reader->getBlockSize());
+                    // 更新已确认的块号
                     lwnConfirmedBlock = currentBlock;
                 } else if (unlikely(lwnNumCnt > lwnNumMax))
+                    // 如果LWN计数器溢出，抛出异常
                     throw RedoLogException(50055, "lwn overflow: " + std::to_string(lwnNumCnt) + "/" + std::to_string(lwnNumMax));
 
-                // Free memory
+                // 释放内存
                 if (redoBufferPos == Ctx::MEMORY_CHUNK_SIZE) {
+                    // 释放已处理的缓冲区
                     reader->bufferFree(ctx->parserThread, redoBufferNum);
+                    // 确认已读取的数据
                     reader->confirmReadData(confirmedBufferStart);
                 }
             }
 
-            // Processing finished
+            // 处理完成
+            // 如果未切换重做日志且LWN的SCN大于0，且已处理完所有缓冲区数据，且读取器状态为完成
             if (!switchRedo && lwnScn > Scn::zero() && confirmedBufferStart == reader->getBufferEnd() && reader->getRet() == Reader::REDO_CODE::FINISHED) {
+                // 如果LWN的SCN大于元数据中的第一个数据SCN
                 if (lwnScn > metadata->firstDataScn) {
+                    // 设置切换重做日志标志
                     switchRedo = true;
-                    if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
-                        ctx->logTrace(Ctx::TRACE::CHECKPOINT, "on: " + lwnScn.toString() + " with switch");
+                    // 处理检查点
                     builder->processCheckpoint(lwnScn, sequence, lwnTimestamp.toEpoch(ctx->hostTimezone),
                                                FileOffset(currentBlock, reader->getBlockSize()), switchRedo);
-                    if (ctx->metrics != nullptr)
-                        ctx->metrics->emitCheckpointsOut(1);
-                } else {
-                    if (ctx->metrics != nullptr)
-                        ctx->metrics->emitCheckpointsSkip(1);
                 }
             }
 
+            // 如果收到软关闭信号
             if (ctx->softShutdown) {
-                if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
-                    ctx->logTrace(Ctx::TRACE::CHECKPOINT, "on: " + lwnScn.toString() + " at exit");
+                // 处理检查点
                 builder->processCheckpoint(lwnScn, sequence, lwnTimestamp.toEpoch(ctx->hostTimezone),
                                            FileOffset(currentBlock, reader->getBlockSize()), false);
-                if (ctx->metrics != nullptr)
-                    ctx->metrics->emitCheckpointsOut(1);
-
+                // 设置读取器返回状态为关闭
                 reader->setRet(Reader::REDO_CODE::SHUTDOWN);
             } else {
+                // 检查读取是否完成
                 if (reader->checkFinished(ctx->parserThread, confirmedBufferStart)) {
+                    // 如果读取完成且下一个SCN未设置且读取器有下一个SCN，则更新下一个SCN
                     if (reader->getRet() == Reader::REDO_CODE::FINISHED && nextScn == Scn::none() && reader->getNextScn() != Scn::none())
                         nextScn = reader->getNextScn();
+                    // 如果读取器状态为停止或被覆盖，更新元数据文件偏移量
                     if (reader->getRet() == Reader::REDO_CODE::STOPPED || reader->getRet() == Reader::REDO_CODE::OVERWRITTEN)
                         metadata->fileOffset = FileOffset(lwnConfirmedBlock, reader->getBlockSize());
+                    // 跳出主循环
                     break;
                 }
             }
-        }
-
-        if (ctx->metrics != nullptr && reader->getNextScn() != Scn::none()) {
-            const int64_t diff = ctx->clock->getTimeT() - reader->getNextTime().toEpoch(ctx->hostTimezone);
-
-            if (group == 0) {
-                ctx->metrics->emitLogSwitchesArchived(1);
-                ctx->metrics->emitLogSwitchesLagArchived(diff);
-            } else {
-                ctx->metrics->emitLogSwitchesOnline(1);
-                ctx->metrics->emitLogSwitchesLagOnline(diff);
-            }
-        }
-
-        // Print performance information
-        if (ctx->isTraceSet(Ctx::TRACE::PERFORMANCE)) {
-            const time_ut cEnd = ctx->clock->getTimeUt();
-            double suppLogPercent = 0.0;
-            if (currentBlock != startBlock)
-                suppLogPercent = 100.0 * ctx->suppLogSize / (static_cast<double>(currentBlock - startBlock) * reader->getBlockSize());
-
-            if (group == 0) {
-                double mySpeed = 0;
-                const double myTime = static_cast<double>(cEnd - cStart) / 1000.0;
-                if (myTime > 0)
-                    mySpeed = static_cast<double>(currentBlock - startBlock) * reader->getBlockSize() * 1000.0 / 1024 / 1024 / myTime;
-
-                double myReadSpeed = 0;
-                if (reader->getSumTime() > 0)
-                    myReadSpeed = (static_cast<double>(reader->getSumRead()) * 1000000.0 / 1024 / 1024 / static_cast<double>(reader->getSumTime()));
-
-                ctx->logTrace(Ctx::TRACE::PERFORMANCE, std::to_string(myTime) + " ms, " +
-                                                       "Speed: " + std::to_string(mySpeed) + " MB/s, " +
-                                                       "Redo log size: " + std::to_string(static_cast<uint64_t>(currentBlock - startBlock) *
-                                                                                          reader->getBlockSize() / 1024 / 1024) +
-                                                       " MB, Read size: " + std::to_string(reader->getSumRead() / 1024 / 1024) + " MB, " +
-                                                       "Read speed: " + std::to_string(myReadSpeed) + " MB/s, " +
-                                                       "Max LWN size: " + std::to_string(lwnAllocatedMax) + ", " +
-                                                       "Supplemental redo log size: " + std::to_string(ctx->suppLogSize) + " bytes " +
-                                                       "(" + std::to_string(suppLogPercent) + " %)");
-            } else {
-                ctx->logTrace(Ctx::TRACE::PERFORMANCE, "Redo log size: " + std::to_string(static_cast<uint64_t>(currentBlock - startBlock) *
-                                                                                          reader->getBlockSize() / 1024 / 1024) + " MB, " +
-                                                       "Max LWN size: " + std::to_string(lwnAllocatedMax) + ", " +
-                                                       "Supplemental redo log size: " + std::to_string(ctx->suppLogSize) + " bytes " +
-                                                       "(" + std::to_string(suppLogPercent) + " %)");
-            }
-        }
-
-        if (ctx->dumpRedoLog >= 1 && ctx->dumpStream->is_open()) {
-            *ctx->dumpStream << "END OF REDO DUMP\n";
-            ctx->dumpStream->close();
         }
 
         builder->flush();

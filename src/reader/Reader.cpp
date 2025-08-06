@@ -496,17 +496,31 @@ namespace OpenLogReplicator {
         return retReload;
     }
 
+    /**
+     * @brief 从Redo日志文件中读取数据到缓冲区(read1)
+     * 
+     * 此函数负责从Redo日志文件中读取数据到内存缓冲区。它计算需要读取的数据量，
+     * 处理边界情况（如文件末尾），分配必要的缓冲区内存，并执行实际的读取操作。
+     * 
+     * @return bool 读取成功返回true，失败返回false
+     */
     bool Reader::read1() {
+        // 计算本次需要读取的数据量
         uint toRead = readSize(lastRead);
 
+        // 如果读取会超出文件大小，则调整读取量为文件剩余大小
         if (bufferScan + toRead > fileSize)
             toRead = fileSize - bufferScan;
 
+        // 计算缓冲区中的位置和缓冲区编号
         const uint64_t redoBufferPos = bufferScan % Ctx::MEMORY_CHUNK_SIZE;
         const uint64_t redoBufferNum = (bufferScan / Ctx::MEMORY_CHUNK_SIZE) % ctx->memoryChunksReadBufferMax;
+        
+        // 如果读取会超出当前内存块边界，则调整读取量
         if (redoBufferPos + toRead > Ctx::MEMORY_CHUNK_SIZE)
             toRead = Ctx::MEMORY_CHUNK_SIZE - redoBufferPos;
 
+        // 检查读取量是否为0，如果为0则报错返回
         if (toRead == 0) {
             ctx->error(40010, "file: " + fileName + " - zero to read, start: " + std::to_string(bufferStart) + ", end: " +
                               std::to_string(bufferEnd) + ", scan: " + std::to_string(bufferScan));
@@ -514,27 +528,37 @@ namespace OpenLogReplicator {
             return false;
         }
 
+        // 分配读取缓冲区
         bufferAllocate(redoBufferNum);
+        // 如果启用了磁盘跟踪，则记录读取信息
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::DISK)))
             ctx->logTrace(Ctx::TRACE::DISK, "reading#1 " + fileName + " at (" + std::to_string(bufferStart) + "/" +
                                             std::to_string(bufferEnd) + "/" + std::to_string(bufferScan) + ") bytes: " + std::to_string(toRead));
+        // 执行实际的读取操作
         const int actualRead = redoRead(redoBufferList[redoBufferNum] + redoBufferPos, bufferScan, toRead);
 
+        // 如果启用了磁盘跟踪，则记录读取结果
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::DISK)))
             ctx->logTrace(Ctx::TRACE::DISK, "reading#1 " + fileName + " at (" + std::to_string(bufferStart) + "/" +
                                             std::to_string(bufferEnd) + "/" + std::to_string(bufferScan) + ") got: " + std::to_string(actualRead));
+        // 检查读取是否出错
         if (actualRead < 0) {
             ctx->error(40003, "file: " + fileName + " - " + strerror(errno));
             ret = REDO_CODE::ERROR_READ;
             return false;
         }
+        // 更新读取字节数的指标
         if (ctx->metrics != nullptr)
             ctx->metrics->emitBytesRead(actualRead);
 
+        // 如果实际读取了数据且文件描述符有效，并且不需要延迟验证或为第一组日志
         if (actualRead > 0 && fileCopyDes != -1 && (ctx->redoVerifyDelayUs == 0 || group == 0)) {
+            // 将读取的数据写入到复制文件中，从bufferEnd位置开始写入
             const int bytesWritten = pwrite(fileCopyDes, redoBufferList[redoBufferNum] + redoBufferPos, actualRead,
                                             static_cast<int64_t>(bufferEnd));
+            // 检查写入的字节数是否与实际读取的字节数一致
             if (bytesWritten != actualRead) {
+                // 如果不一致，则记录错误信息并返回写入错误
                 ctx->error(10007, "file: " + fileNameWrite + " - " + std::to_string(bytesWritten) + " bytes written instead of " +
                                   std::to_string(actualRead) + ", code returned: " + strerror(errno));
                 ret = REDO_CODE::ERROR_WRITE;
@@ -542,86 +566,117 @@ namespace OpenLogReplicator {
             }
         }
 
+        // 计算实际读取的数据块数量
         const typeBlk maxNumBlock = actualRead / blockSize;
+        // 计算当前扫描位置对应的块号
         const typeBlk bufferScanBlock = bufferScan / blockSize;
+        // 初始化有效数据块计数器
         uint goodBlocks = 0;
+        // 初始化返回码为OK
         REDO_CODE currentRet = REDO_CODE::OK;
 
-        // Check which blocks are good
+        // 检查每个数据块的有效性
         for (typeBlk numBlock = 0; numBlock < maxNumBlock; ++numBlock) {
+            // 调用checkBlockHeader检查数据块头部信息，验证数据块是否有效
             currentRet = checkBlockHeader(redoBufferList[redoBufferNum] + redoBufferPos + (numBlock * blockSize), bufferScanBlock + numBlock,
                                           ctx->redoVerifyDelayUs == 0 || group == 0);
+            // 如果启用了磁盘跟踪日志，则记录当前块的检查结果
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::DISK)))
                 ctx->logTrace(Ctx::TRACE::DISK, "block: " + std::to_string(bufferScanBlock + numBlock) + " check: " +
                                                 std::to_string(static_cast<uint>(currentRet)));
 
+            // 如果当前数据块检查失败，则跳出循环
             if (currentRet != REDO_CODE::OK)
                 break;
+            // 增加有效数据块计数
             ++goodBlocks;
         }
 
-        // Partial online redo log file
+        // 处理部分在线重做日志文件的情况
+        // 当没有有效数据块且为第一组日志时
         if (goodBlocks == 0 && group == 0) {
+            // 如果下一个SCN头不为空，表示已到达文件尾部，标记为完成
             if (nextScnHeader != Scn::none()) {
                 ret = REDO_CODE::FINISHED;
                 nextScn = nextScnHeader;
             } else {
+                // 否则记录警告信息并停止读取
                 ctx->warning(60023, "file: " + fileName + " - position: " + std::to_string(bufferScan) + " - unexpected end of file");
                 ret = REDO_CODE::STOPPED;
             }
             return false;
         }
 
-        // Treat bad blocks as empty
+        // 将CRC错误的坏块视为空块处理
+        // 当存在CRC错误、需要延迟验证且不为第一组日志时
         if (currentRet == REDO_CODE::ERROR_CRC && ctx->redoVerifyDelayUs > 0 && group != 0)
             currentRet = REDO_CODE::EMPTY;
 
+        // 如果没有有效数据块且返回码不是OK或EMPTY，则返回当前错误码
         if (goodBlocks == 0 && currentRet != REDO_CODE::OK && currentRet != REDO_CODE::EMPTY) {
             ret = currentRet;
             return false;
         }
 
-        // Check for log switch
+        // 检查是否发生日志切换
+        // 当没有有效数据块且当前返回码为空时，重新加载头部信息
         if (goodBlocks == 0 && currentRet == REDO_CODE::EMPTY) {
             currentRet = reloadHeader();
             if (currentRet != REDO_CODE::OK) {
                 ret = currentRet;
                 return false;
             }
+            // 标记已到达零点
             reachedZero = true;
         } else {
+            // 标记已读取数据块
             readBlocks = true;
+            // 未到达零点
             reachedZero = false;
         }
 
+        // 记录本次读取的字节数和时间戳
         lastRead = goodBlocks * blockSize;
         lastReadTime = ctx->clock->getTimeUt();
+        // 如果有有效数据块
         if (goodBlocks > 0) {
+            // 如果需要延迟验证且不是第一组日志
             if (ctx->redoVerifyDelayUs > 0 && group != 0) {
+                // 更新扫描位置
                 bufferScan += goodBlocks * blockSize;
 
+                // 为每个数据块记录读取时间
                 for (uint numBlock = 0; numBlock < goodBlocks; ++numBlock) {
                     auto* readTimeP = reinterpret_cast<time_t*>(redoBufferList[redoBufferNum] + redoBufferPos + (numBlock * blockSize));
                     *readTimeP = lastReadTime;
                 }
             } else {
+                // 不需要延迟验证的情况
                 {
+                    // 设置上下文为互斥锁状态
                     contextSet(CONTEXT::MUTEX, REASON::READER_READ1);
+                    // 获取互斥锁
                     std::unique_lock<std::mutex> const lck(mtx);
+                    // 更新缓冲区结束位置和扫描位置
                     bufferEnd += goodBlocks * blockSize;
                     bufferScan = bufferEnd;
+                    // 通知解析器线程有新数据
                     condParserSleeping.notify_all();
                 }
+                // 恢复CPU上下文
                 contextSet(CONTEXT::CPU);
             }
         }
 
-        // Batch mode with a partial online redo log file
+        // 批量模式下处理部分在线重做日志文件的序列错误
+        // 当返回错误代码为序列错误且为第一组日志时
         if (currentRet == REDO_CODE::ERROR_SEQUENCE && group == 0) {
+            // 如果下一个SCN头不为空，表示已到达文件尾部，标记为完成
             if (nextScnHeader != Scn::none()) {
                 ret = REDO_CODE::FINISHED;
                 nextScn = nextScnHeader;
             } else {
+                // 否则记录警告信息并停止读取
                 ctx->warning(60023, "file: " + fileName + " - position: " + std::to_string(bufferScan) + " - unexpected end of file");
                 ret = REDO_CODE::STOPPED;
             }
@@ -820,6 +875,134 @@ namespace OpenLogReplicator {
                     condParserSleeping.notify_all();
                 }
                 contextSet(CONTEXT::CPU);
+            } else if (status == STATUS::READ) {
+                // 如果启用了磁盘跟踪，则记录当前读取位置和文件大小信息
+                if (unlikely(ctx->isTraceSet(Ctx::TRACE::DISK)))
+                    ctx->logTrace(Ctx::TRACE::DISK, "reading " + fileName + " at (" + std::to_string(bufferStart) + "/" +
+                                                    std::to_string(bufferEnd) + ") at size: " + std::to_string(fileSize));
+                // 初始化上次读取大小和时间相关变量
+                lastRead = blockSize;
+                lastReadTime = 0;
+                readTime = 0;
+                // 设置扫描位置为当前缓冲区末尾
+                bufferScan = bufferEnd;
+                // 重置零块标记
+                reachedZero = false;
+
+                // 在READ状态下持续读取文件，直到满足退出条件
+                while (!ctx->softShutdown && status == STATUS::READ) {
+                    // 获取当前时间，用于计算读取间隔
+                    loopTime = ctx->clock->getTimeUt();
+                    // 重置读取块标记和读取时间
+                    readBlocks = false;
+                    readTime = 0;
+
+                    // 检查是否已读取到文件末尾
+                    if (bufferEnd == fileSize) {
+                        // 如果已读取到文件末尾，根据nextScnHeader的值决定返回状态
+                        if (nextScnHeader != Scn::none()) {
+                            // 如果nextScnHeader有效，则标记为已完成
+                            ret = REDO_CODE::FINISHED;
+                            nextScn = nextScnHeader;
+                        } else {
+                            // 如果nextScnHeader无效，则发出警告并标记为已停止
+                            ctx->warning(60023, "file: " + fileName + " - position: " + std::to_string(bufferScan) +
+                                                " - unexpected end of file");
+                            ret = REDO_CODE::STOPPED;
+                        }
+                        // 退出读取循环
+                        break;
+                    }
+
+                    // 检查缓冲区是否已满
+                    if (bufferStart + ctx->bufferSizeMax == bufferEnd) {
+                        // 设置上下文为互斥锁状态，表示需要等待缓冲区空间
+                        contextSet(CONTEXT::MUTEX, REASON::READER_FULL);
+                        // 获取互斥锁
+                        std::unique_lock<std::mutex> lck(mtx);
+                        // 再次检查缓冲区是否已满（防止在获取锁期间状态发生变化）
+                        if (!ctx->softShutdown && bufferStart + ctx->bufferSizeMax == bufferEnd) {
+                            // 如果启用了睡眠跟踪，则记录日志
+                            if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
+                                ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:mainLoop:bufferFull");
+                            // 设置上下文为等待状态
+                            contextSet(CONTEXT::WAIT, REASON::READER_BUFFER_FULL);
+                            // 等待缓冲区有空间的条件变量
+                            condBufferFull.wait(lck);
+                            // 恢复上下文为CPU状态
+                            contextSet(CONTEXT::CPU);
+                            // 继续下一次循环
+                            continue;
+                        }
+                    }
+
+                    // 检查缓冲区是否需要更多数据
+                    // 当已扫描位置超过有效数据结束位置时，调用read2()读取更多数据
+                    // 如果read2()失败则跳出循环
+                    if (bufferEnd < bufferScan)
+                        if (!read2())
+                            break;
+
+                    // #1 read
+                    // 主要读取逻辑：检查是否需要读取更多数据
+                    // 条件包括：
+                    // 1. 扫描位置小于文件大小
+                    // 2. 缓冲区有空闲空间或扫描位置未对齐到内存块边界
+                    // 3. 未达到零块或距离上次读取时间已超过设定的休眠时间
+                    // 如果read1()失败则跳出循环
+                    if (bufferScan < fileSize && (bufferIsFree() || (bufferScan % Ctx::MEMORY_CHUNK_SIZE) > 0)
+                        && (!reachedZero || lastReadTime + static_cast<time_t>(ctx->redoReadSleepUs) < loopTime))
+                        if (!read1())
+                            break;
+
+                    // 检查是否已到达文件头中指定的块数位置
+                    // 如果已到达且有下一个SCN，则标记为完成；否则记录警告并停止读取
+                    if (numBlocksHeader != Ctx::ZERO_BLK && bufferEnd == static_cast<uint64_t>(numBlocksHeader) * blockSize) {
+                        if (nextScnHeader != Scn::none()) {
+                            ret = REDO_CODE::FINISHED;
+                            nextScn = nextScnHeader;
+                        } else {
+                            ctx->warning(60023, "file: " + fileName + " - position: " + std::to_string(bufferScan) +
+                                                " - unexpected end of file");
+                            ret = REDO_CODE::STOPPED;
+                        }
+                        break;
+                    }
+
+                    // 如果没有读取到数据块，则根据设定的休眠时间进行休眠
+                    // 如果readTime为0，直接休眠redoReadSleepUs微秒
+                    // 否则，根据当前时间和readTime计算休眠时间
+                    if (!readBlocks) {
+                        if (readTime == 0) {
+                            contextSet(CONTEXT::SLEEP);
+                            usleep(ctx->redoReadSleepUs);
+                            contextSet(CONTEXT::CPU);
+                        } else {
+                            const time_ut nowTime = ctx->clock->getTimeUt();
+                            if (readTime > nowTime) {
+                                // 如果redoReadSleepUs小于等待时间，则休眠redoReadSleepUs微秒
+                                // 否则休眠到readTime时间点
+                                if (static_cast<time_ut>(ctx->redoReadSleepUs) < readTime - nowTime) {
+                                    contextSet(CONTEXT::SLEEP);
+                                    usleep(ctx->redoReadSleepUs);
+                                    contextSet(CONTEXT::CPU);
+                                } else {
+                                    contextSet(CONTEXT::SLEEP);
+                                    usleep(readTime - nowTime);
+                                    contextSet(CONTEXT::CPU);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                {
+                    contextSet(CONTEXT::MUTEX, REASON::READER_SLEEP2);
+                    std::unique_lock<std::mutex> const lck(mtx);
+                    status = STATUS::SLEEPING;
+                    condParserSleeping.notify_all();
+                }
+                contextSet(CONTEXT::CPU);
             }
         }
     }
@@ -867,25 +1050,46 @@ namespace OpenLogReplicator {
         }
     }
 
+    /**
+     * @brief 分配指定编号的读取缓冲区
+     * 
+     * 此函数用于为读取操作分配指定编号的缓冲区。它首先检查该缓冲区是否已经分配，
+     * 如果已分配则直接返回。否则，从内存管理器获取新的内存块，并更新缓冲区列表
+     * 和空闲缓冲区计数。
+     * 
+     * @param num 要分配的缓冲区编号
+     */
     void Reader::bufferAllocate(uint num) {
+        // 第一次尝试获取互斥锁并检查缓冲区是否已分配
         {
+            // 设置上下文为互斥锁状态，表示正在进行缓冲区分配操作
             contextSet(CONTEXT::MUTEX, REASON::READER_ALLOCATE1);
+            // 获取互斥锁以安全访问共享资源
             std::unique_lock<std::mutex> const lck(mtx);
+            // 检查指定编号的缓冲区是否已经分配，如果已分配则直接返回
             if (redoBufferList[num] != nullptr) {
                 contextSet(CONTEXT::CPU);
                 return;
             }
         }
+        // 释放锁后设置上下文为CPU状态
         contextSet(CONTEXT::CPU);
 
+        // 从上下文的内存管理器获取新的内存块
         uint8_t* buffer = ctx->getMemoryChunk(this, Ctx::MEMORY::READER);
 
+        // 第二次获取互斥锁以更新缓冲区列表
         {
+            // 设置上下文为互斥锁状态，表示正在进行缓冲区列表更新
             contextSet(CONTEXT::MUTEX, REASON::READER_ALLOCATE2);
+            // 获取互斥锁以安全更新共享资源
             std::unique_lock<std::mutex> const lck(mtx);
+            // 将新分配的内存块添加到缓冲区列表中
             redoBufferList[num] = buffer;
+            // 减少空闲缓冲区计数
             --ctx->bufferSizeFree;
         }
+        // 释放锁后设置上下文为CPU状态
         contextSet(CONTEXT::CPU);
     }
 
@@ -923,13 +1127,25 @@ namespace OpenLogReplicator {
         ctx->freeMemoryChunk(this, Ctx::MEMORY::READER, buffer);
     }
 
+    /**
+     * @brief 检查读取缓冲区是否有空闲空间
+     * 
+     * 此函数用于检查当前读取缓冲区是否有空闲空间可用于分配。
+     * 它通过检查上下文中的空闲缓冲区计数来判断。
+     * 
+     * @return bool 如果有空闲缓冲区返回true，否则返回false
+     */
     bool Reader::bufferIsFree() {
         bool isFree;
         {
+            // 设置上下文为互斥锁状态，表示正在进行缓冲区空闲检查
             contextSet(CONTEXT::MUTEX, REASON::READER_CHECK_FREE);
+            // 获取互斥锁以安全访问共享资源
             std::unique_lock<std::mutex> const lck(mtx);
+            // 检查空闲缓冲区数量是否大于0
             isFree = (ctx->bufferSizeFree > 0);
         }
+        // 恢复上下文为CPU状态
         contextSet(CONTEXT::CPU);
         return isFree;
     }
